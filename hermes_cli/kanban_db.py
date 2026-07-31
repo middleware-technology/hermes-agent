@@ -24,14 +24,15 @@ feature keep working with zero migration. See :func:`kanban_db_path`.
 
 Board resolution order (highest precedence first, all optional):
 
+* ``HERMES_KANBAN_DB`` env var normally pins the DB file path directly.
+  A Babel host may still address an explicit named board while
+  ``BABEL_HERMES_HOME`` is set so one worker-scoped override cannot hide
+  every other board from the host process.
 * ``board=`` argument passed directly to :func:`connect` / :func:`init_db`
   (explicit — used by the CLI ``--board`` flag and the dashboard
   ``?board=...`` query param).
 * ``HERMES_KANBAN_BOARD`` env var (used by the dispatcher to pin workers
   to the board their task lives on — workers cannot see other boards).
-* ``HERMES_KANBAN_DB`` env var (pins the DB file path directly — legacy
-  override still honoured; highest precedence when the file path itself
-  is what the caller wants to force).
 * ``<root>/kanban/current`` — a one-line text file holding the slug of
   the "currently selected" board. Written by ``hermes kanban boards
   switch <slug>``. When absent, the active board is ``default``.
@@ -149,7 +150,8 @@ def kanban_home() -> Path:
 
     1. ``HERMES_KANBAN_HOME`` env var when set and non-empty (explicit
        override for tests and unusual deployments).
-    2. ``get_default_hermes_root()``, which already returns ``<root>``
+    2. ``BABEL_HERMES_HOME`` when embedded in Babel.
+    3. ``get_default_hermes_root()``, which already returns ``<root>``
        when ``HERMES_HOME`` is ``<root>/profiles/<name>``, and returns
        ``HERMES_HOME`` directly for Docker / custom deployments.
 
@@ -161,6 +163,9 @@ def kanban_home() -> Path:
     override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
     if override:
         return Path(override).expanduser()
+    babel_home = os.environ.get("BABEL_HERMES_HOME", "").strip()
+    if babel_home:
+        return Path(babel_home).expanduser()
     from hermes_constants import get_default_hermes_root
     return get_default_hermes_root()
 
@@ -284,16 +289,18 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     Resolution (highest precedence first):
 
     1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
-       back-compat and for the dispatcher→worker handoff (defense in
-       depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement).
+       back-compat and for the dispatcher→worker handoff. When Babel sets
+       ``BABEL_HERMES_HOME``, an explicit named ``board`` is instead resolved
+       from that root so the host can orchestrate boards other than the one
+       currently pinned for a worker.
     2. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
     3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if override:
+    babel_host = bool(os.environ.get("BABEL_HERMES_HOME", "").strip())
+    if override and (board is None or not babel_host):
         return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
@@ -2357,6 +2364,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -2416,7 +2424,7 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
-        if expected_run_id is None:
+        if expected_run_id is None and expected_claim_lock is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -2443,11 +2451,39 @@ def complete_task(
                        worker_pid   = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
+                   AND (? IS NULL OR current_run_id = ?)
+                   AND (? IS NULL OR claim_lock = ?)
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (
+                    result,
+                    now,
+                    task_id,
+                    int(expected_run_id) if expected_run_id is not None else None,
+                    int(expected_run_id) if expected_run_id is not None else None,
+                    expected_claim_lock,
+                    expected_claim_lock,
+                ),
             )
         if cur.rowcount != 1:
+            # A transport can lose the success response after the mutation
+            # commits. Treat an exact replay of that run/outcome as success,
+            # while a newer active run remains fenced out by the CAS above.
+            if expected_run_id is not None:
+                applied = conn.execute(
+                    """
+                    SELECT 1
+                      FROM tasks t
+                      JOIN task_runs r ON r.task_id = t.id
+                     WHERE t.id = ?
+                       AND t.status = 'done'
+                       AND r.id = ?
+                       AND r.outcome = 'completed'
+                     LIMIT 1
+                    """,
+                    (task_id, int(expected_run_id)),
+                ).fetchone()
+                if applied:
+                    return True
             return False
         run_id = _end_run(
             conn, task_id,
@@ -2587,10 +2623,11 @@ def block_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Transition ``running -> blocked``."""
     with write_txn(conn):
-        if expected_run_id is None:
+        if expected_run_id is None and expected_claim_lock is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -2613,11 +2650,34 @@ def block_task(
                        worker_pid   = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                   AND current_run_id = ?
+                   AND (? IS NULL OR current_run_id = ?)
+                   AND (? IS NULL OR claim_lock = ?)
                 """,
-                (task_id, int(expected_run_id)),
+                (
+                    task_id,
+                    int(expected_run_id) if expected_run_id is not None else None,
+                    int(expected_run_id) if expected_run_id is not None else None,
+                    expected_claim_lock,
+                    expected_claim_lock,
+                ),
             )
         if cur.rowcount != 1:
+            if expected_run_id is not None:
+                applied = conn.execute(
+                    """
+                    SELECT 1
+                      FROM tasks t
+                      JOIN task_runs r ON r.task_id = t.id
+                     WHERE t.id = ?
+                       AND t.status = 'blocked'
+                       AND r.id = ?
+                       AND r.outcome = 'blocked'
+                     LIMIT 1
+                    """,
+                    (task_id, int(expected_run_id)),
+                ).fetchone()
+                if applied:
+                    return True
             return False
         run_id = _end_run(
             conn, task_id,

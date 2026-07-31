@@ -107,3 +107,16 @@ def test_iteration_budget_remaining():
     assert budget.remaining == 2
     budget.refund()
     assert budget.remaining == 3
+
+
+def test_iteration_budget_can_be_explicitly_unbounded():
+    from run_agent import IterationBudget
+
+    budget = IterationBudget(max_total=None)
+
+    for _ in range(10_000):
+        assert budget.consume() is True
+
+    assert budget.used == 10_000
+    assert budget.remaining is None
+    assert budget.exhausted is False

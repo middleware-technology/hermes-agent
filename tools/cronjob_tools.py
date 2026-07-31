@@ -279,6 +279,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["no_agent"] = True
     if job.get("enabled_toolsets"):
         result["enabled_toolsets"] = job["enabled_toolsets"]
+    if job.get("context_from"):
+        result["context_from"] = job["context_from"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
     return result

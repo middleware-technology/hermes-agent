@@ -1507,6 +1507,11 @@ def _handle_process(args, **kw):
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        session = process_registry.get(session_id)
+        if session is None or (task_id and session.task_id != task_id):
+            # Treat cross-task process IDs as absent. A scoped worker may only
+            # observe or control processes spawned under its durable tool task.
+            return tool_error(f"No process with ID {session_id}")
         if action == "poll":
             return json.dumps(process_registry.poll(session_id), ensure_ascii=False)
         elif action == "log":

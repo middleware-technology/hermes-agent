@@ -3427,6 +3427,27 @@ class TestRunConversation:
             "kanban_block should not be called outside kanban mode"
         )
 
+    def test_none_max_iterations_runs_without_a_turn_ceiling(self, agent):
+        self._setup_agent(agent)
+        agent.max_iterations = None
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Finished without a configured iteration ceiling.",
+            finish_reason="stop",
+        )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("finish the task")
+
+        assert result["completed"] is True
+        assert result["final_response"] == (
+            "Finished without a configured iteration ceiling."
+        )
+        assert agent.iteration_budget.max_total is None
+
 
 class TestRetryExhaustion:
     """Regression: retry_count > max_retries was dead code (off-by-one).

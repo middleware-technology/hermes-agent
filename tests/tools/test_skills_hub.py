@@ -603,7 +603,29 @@ class TestWellKnownSkillSource:
 
         assert len(results) == 1
         called_url = mock_get.call_args.args[0]
-        assert called_url == "https://example.com/.well-known/skills/index.json"
+        assert called_url == "https://example.com/.well-known/agent-skills/index.json"
+
+    @patch("tools.skills_hub._write_index_cache")
+    @patch("tools.skills_hub._read_index_cache", return_value=None)
+    @patch("tools.skills_hub.httpx.get")
+    def test_domain_root_falls_back_to_legacy_endpoint(
+        self, mock_get, _mock_read_cache, _mock_write_cache
+    ):
+        mock_get.side_effect = [
+            MagicMock(status_code=404),
+            MagicMock(
+                status_code=200,
+                json=lambda: {"skills": [{"name": "legacy-skill"}]},
+            ),
+        ]
+
+        results = self._source().search("https://example.com", limit=10)
+
+        assert [result.name for result in results] == ["legacy-skill"]
+        assert [call.args[0] for call in mock_get.call_args_list] == [
+            "https://example.com/.well-known/agent-skills/index.json",
+            "https://example.com/.well-known/skills/index.json",
+        ]
 
     @patch("tools.skills_hub._write_index_cache")
     @patch("tools.skills_hub._read_index_cache", return_value=None)

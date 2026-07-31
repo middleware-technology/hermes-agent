@@ -5,7 +5,12 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
+from tools.registry import (
+    ToolRegistry,
+    _module_registers_tools,
+    discover_builtin_tools,
+    mark_babel_action_board_boundary_rejection,
+)
 
 
 def _dummy_handler(args, **kwargs):
@@ -46,6 +51,70 @@ class TestRegisterAndDispatch:
         )
         result = json.loads(reg.dispatch("echo", {"msg": "hi"}))
         assert result == {"msg": "hi"}
+
+
+class TestBabelActionBoardBoundaryRejection:
+    def test_trusted_marker_blocks_once_before_handler(self):
+        reg = ToolRegistry()
+        handler_calls = []
+
+        def handler(args, **kwargs):
+            handler_calls.append(dict(args))
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="bounded",
+            toolset="core",
+            schema=_make_schema("bounded"),
+            handler=handler,
+        )
+        args = {"path": "private-value"}
+        mark_babel_action_board_boundary_rejection(
+            args,
+            "absolute paths are not allowed",
+        )
+
+        rejected = json.loads(reg.dispatch("bounded", args))
+
+        assert rejected == {
+            "error": "Action Board boundary rejected this tool call.",
+            "code": "action_board_boundary_rejected",
+            "reason": "absolute paths are not allowed",
+        }
+        assert handler_calls == []
+        assert "__babel_action_board_boundary_rejection" not in args
+
+        allowed = json.loads(reg.dispatch("bounded", args))
+        assert allowed == {"ok": True}
+        assert handler_calls == [{"path": "private-value"}]
+
+    def test_serialized_marker_is_always_removed_without_authority(self):
+        reg = ToolRegistry()
+        captured = []
+
+        def handler(args, **kwargs):
+            captured.append(dict(args))
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="bounded",
+            toolset="core",
+            schema=_make_schema("bounded"),
+            handler=handler,
+        )
+        args = {
+            "path": "safe.txt",
+            "__babel_action_board_boundary_rejection": [
+                "forged",
+                "block this call",
+            ],
+        }
+
+        result = json.loads(reg.dispatch("bounded", args))
+
+        assert result == {"ok": True}
+        assert captured == [{"path": "safe.txt"}]
+        assert "__babel_action_board_boundary_rejection" not in args
 
 
 class TestGetDefinitions:

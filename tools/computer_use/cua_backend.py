@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
 import json
 import logging
 import os
@@ -80,6 +81,14 @@ def _is_arm_mac() -> bool:
 def cua_driver_binary_available() -> bool:
     """True if `cua-driver` is on $PATH or HERMES_CUA_DRIVER_CMD resolves."""
     return bool(shutil.which(_CUA_DRIVER_CMD))
+
+
+def mcp_client_available() -> bool:
+    """True when the Python MCP client required by the stdio bridge is installed."""
+    try:
+        return importlib.util.find_spec("mcp") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def cua_driver_install_hint() -> str:

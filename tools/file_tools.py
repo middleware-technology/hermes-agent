@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import tempfile
 import threading
 from pathlib import Path
 
@@ -19,6 +20,34 @@ from tools import file_state
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+
+_BABEL_SCOPED_FILE_ROOT_KEY = "__babel_scoped_file_root"
+_BABEL_SCOPED_FILE_ROOT_SENTINEL = object()
+
+
+def mark_babel_scoped_file_args(args: dict, root: str | Path) -> None:
+    """Attach Babel's non-serializable scoped-file capability to one call."""
+
+    args[_BABEL_SCOPED_FILE_ROOT_KEY] = (
+        _BABEL_SCOPED_FILE_ROOT_SENTINEL,
+        str(root),
+    )
+
+
+def _consume_babel_scoped_file_root(args: dict) -> str | None:
+    """Consume and validate Babel's scoped-file capability exactly once."""
+
+    marker = args.pop(_BABEL_SCOPED_FILE_ROOT_KEY, None)
+    if (
+        isinstance(marker, tuple)
+        and len(marker) == 2
+        and marker[0] is _BABEL_SCOPED_FILE_ROOT_SENTINEL
+        and isinstance(marker[1], str)
+        and marker[1]
+    ):
+        return marker[1]
+    return None
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
@@ -155,6 +184,16 @@ _SENSITIVE_PATH_PREFIXES = (
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
 
+def _is_user_temp_path(filepath: str) -> bool:
+    """Return whether ``filepath`` resolves within this user's temp root."""
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        candidate = Path(filepath).resolve()
+        return os.path.commonpath((str(temp_root), str(candidate))) == str(temp_root)
+    except (OSError, ValueError):
+        return False
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
@@ -166,7 +205,10 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    is_user_temp = _is_user_temp_path(resolved)
     for prefix in _SENSITIVE_PATH_PREFIXES:
+        if prefix == "/private/var/" and is_user_temp:
+            continue
         if resolved.startswith(prefix) or normalized.startswith(prefix):
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
@@ -433,6 +475,17 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     with _file_ops_lock:
         _file_ops_cache[task_id] = file_ops
     return file_ops
+
+
+def _get_scoped_file_ops(task_id: str, root: str) -> ShellFileOperations:
+    """Create a call-local view that cannot launch external validation."""
+
+    cached = _get_file_ops(task_id)
+    return ShellFileOperations(
+        cached.env,
+        cwd=root,
+        inprocess_validation_only=True,
+    )
 
 
 def clear_file_ops_cache(task_id: str = None):
@@ -790,7 +843,13 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     return None
 
 
-def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
+def write_file_tool(
+    path: str,
+    content: str,
+    task_id: str = "default",
+    *,
+    file_ops_override: ShellFileOperations | None = None,
+) -> str:
     """Write content to a file."""
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
@@ -811,7 +870,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
-            file_ops = _get_file_ops(task_id)
+            file_ops = file_ops_override or _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             if stale_warning:
@@ -827,7 +886,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
             stale_warning = _check_file_staleness(path, task_id)
-            file_ops = _get_file_ops(task_id)
+            file_ops = file_ops_override or _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning
@@ -849,16 +908,23 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
-               task_id: str = "default") -> str:
+               task_id: str = "default", *,
+               file_ops_override: ShellFileOperations | None = None) -> str:
     """Patch a file using replace mode or V4A patch format."""
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
-    if path:
+    if mode == "replace" and path:
         _paths_to_check.append(path)
     if mode == "patch" and patch:
-        import re as _re
-        for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            _paths_to_check.append(_m.group(1).strip())
+        from tools.patch_parser import parse_v4a_patch
+
+        _operations, _parse_error = parse_v4a_patch(patch)
+        if _parse_error is None:
+            for _operation in _operations:
+                if _operation.file_path:
+                    _paths_to_check.append(_operation.file_path)
+                if _operation.new_path:
+                    _paths_to_check.append(_operation.new_path)
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
@@ -902,7 +968,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _sw:
                     stale_warnings.append(_sw)
 
-            file_ops = _get_file_ops(task_id)
+            file_ops = file_ops_override or _get_file_ops(task_id)
 
             if mode == "replace":
                 if not path:
@@ -1121,11 +1187,13 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
+    _consume_babel_scoped_file_root(args)
     return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
 
 
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
+    scoped_root = _consume_babel_scoped_file_root(args)
     if not args.get("path") or not isinstance(args.get("path"), str):
         return tool_error(
             "write_file: missing required field 'path'. Re-emit the tool call with "
@@ -1144,19 +1212,29 @@ def _handle_write_file(args, **kw):
             f"write_file: 'content' must be a string, got "
             f"{type(args['content']).__name__}."
         )
-    return write_file_tool(path=args["path"], content=args["content"], task_id=tid)
+    scoped_file_ops = _get_scoped_file_ops(tid, scoped_root) if scoped_root else None
+    return write_file_tool(
+        path=args["path"],
+        content=args["content"],
+        task_id=tid,
+        file_ops_override=scoped_file_ops,
+    )
 
 
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
+    scoped_root = _consume_babel_scoped_file_root(args)
+    scoped_file_ops = _get_scoped_file_ops(tid, scoped_root) if scoped_root else None
     return patch_tool(
         mode=args.get("mode", "replace"), path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),
-        replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid)
+        replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
+        file_ops_override=scoped_file_ops)
 
 
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
+    _consume_babel_scoped_file_root(args)
     target_map = {"grep": "content", "find": "files"}
     raw_target = args.get("target", "content")
     target = target_map.get(raw_target, raw_target)

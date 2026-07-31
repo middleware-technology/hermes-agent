@@ -508,7 +508,13 @@ class ShellFileOperations(FileOperations):
     This includes local, docker, singularity, ssh, modal, and daytona environments.
     """
     
-    def __init__(self, terminal_env, cwd: str = None):
+    def __init__(
+        self,
+        terminal_env,
+        cwd: str = None,
+        *,
+        inprocess_validation_only: bool = False,
+    ):
         """
         Initialize file operations with a terminal environment.
 
@@ -539,6 +545,10 @@ class ShellFileOperations(FileOperations):
         # If nothing provides a cwd, use "/" as a safe universal default.
         self.cwd = cwd or getattr(terminal_env, 'cwd', None) or \
                    getattr(getattr(terminal_env, 'config', None), 'cwd', None) or "/"
+        # Scoped Action Board writes run outside the terminal Seatbelt wrapper.
+        # Keep syntax checks that execute in this Python process, but never
+        # launch shell linters or host LSP processes from that dispatch path.
+        self.inprocess_validation_only = bool(inprocess_validation_only)
 
         # Cache for command availability checks
         self._command_cache: Dict[str, bool] = {}
@@ -926,7 +936,10 @@ class ShellFileOperations(FileOperations):
         # skipping the read keeps the hot path fast.
         ext = os.path.splitext(path)[1].lower()
         pre_content: Optional[str] = None
-        want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
+        want_pre = ext in LINTERS_INPROC or (
+            not getattr(self, "inprocess_validation_only", False)
+            and self._lsp_handles_extension(ext)
+        )
         if want_pre:
             # Best-effort read; failure (file missing, permission) leaves
             # pre_content as None which makes both downstream consumers
@@ -1165,6 +1178,14 @@ class ShellFileOperations(FileOperations):
                 return LintResult(skipped=True, message=f"No linter available for {ext} (missing dependency)")
             return LintResult(success=ok, output="" if ok else err)
 
+        if getattr(self, "inprocess_validation_only", False):
+            return LintResult(
+                skipped=True,
+                message=(
+                    f"External validation disabled for scoped Action Board {ext or 'file'} writes"
+                ),
+            )
+
         # Fall back to shell linter.
         if ext not in LINTERS:
             return LintResult(skipped=True, message=f"No linter for {ext} files")
@@ -1297,6 +1318,8 @@ class ShellFileOperations(FileOperations):
         host-side LSP server can't reach them, so we skip the LSP
         path for those entirely.
         """
+        if getattr(self, "inprocess_validation_only", False):
+            return False
         env = getattr(self, "env", None)
         if env is None:
             # Defensive: some tests construct ShellFileOperations via

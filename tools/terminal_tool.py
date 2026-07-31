@@ -50,6 +50,33 @@ from typing import Optional, Dict, Any, List
 logger = logging.getLogger(__name__)
 
 
+# Babel's scoped Action Board runtime validates the model-authored command and
+# replaces it with an OS-sandboxed wrapper immediately before dispatch.  The
+# registered handler must be able to bypass terminal_tool's second lexical
+# prompt for that wrapper, but a model-provided JSON flag must never grant the
+# same authority.  An in-process identity sentinel keeps that capability out
+# of the public tool schema and impossible to reproduce through JSON.
+_BABEL_TRUSTED_TERMINAL_FORCE_KEY = "__babel_trusted_terminal_force"
+_BABEL_TRUSTED_TERMINAL_FORCE_SENTINEL = object()
+
+
+def mark_babel_trusted_terminal_args(args: dict[str, Any]) -> None:
+    """Mark one already-validated terminal argument mapping for dispatch."""
+
+    args[_BABEL_TRUSTED_TERMINAL_FORCE_KEY] = (
+        _BABEL_TRUSTED_TERMINAL_FORCE_SENTINEL
+    )
+
+
+def _consume_babel_trusted_terminal_force(args: dict[str, Any]) -> bool:
+    """Consume Babel's non-serializable trust marker exactly once."""
+
+    return (
+        args.pop(_BABEL_TRUSTED_TERMINAL_FORCE_KEY, None)
+        is _BABEL_TRUSTED_TERMINAL_FORCE_SENTINEL
+    )
+
+
 # ---------------------------------------------------------------------------
 # Global interrupt event: set by the agent when a user interrupt arrives.
 # The terminal tool polls this during command execution so it can kill
@@ -1089,6 +1116,40 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_env": _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON"),
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
         "docker_extra_args": _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON"),
+    }
+
+
+def get_effective_terminal_backend_state(
+    task_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return configured and cached backend state for a pending tool call.
+
+    A long-lived Hermes process may retain an environment created under an
+    earlier ``TERMINAL_ENV`` value.  Callers enforcing a local-only boundary
+    must therefore inspect both configuration (what a future cache miss would
+    create) and the live cached object (what the next dispatch will reuse).
+    """
+
+    configured = str(_get_env_config().get("env_type") or "").strip().lower()
+    effective_task_id = _resolve_container_task_id(task_id)
+    with _env_lock:
+        active_environment = _active_environments.get(effective_task_id)
+
+    active_backend: str | None = None
+    active_is_local: bool | None = None
+    if active_environment is not None:
+        active_is_local = isinstance(active_environment, _LocalEnvironment)
+        active_backend = (
+            "local"
+            if active_is_local
+            else type(active_environment).__name__
+        )
+
+    return {
+        "task_id": effective_task_id,
+        "configured": configured,
+        "active": active_backend,
+        "local_only": configured == "local" and active_is_local is not False,
     }
 
 
@@ -2350,11 +2411,13 @@ TERMINAL_SCHEMA = {
 
 
 def _handle_terminal(args, **kw):
+    babel_trusted_force = _consume_babel_trusted_terminal_force(args)
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
+        force=babel_trusted_force,
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),

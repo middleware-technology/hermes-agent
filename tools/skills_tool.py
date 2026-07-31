@@ -107,6 +107,42 @@ _REMOTE_ENV_BACKENDS = frozenset(
 _secret_capture_callback = None
 
 
+def _hidden_skill_names() -> Set[str]:
+    return {
+        value.strip().casefold()
+        for value in os.getenv("HERMES_HIDDEN_SKILLS", "").replace("\n", ",").split(",")
+        if value.strip()
+    }
+
+
+def _hidden_skill_prefixes() -> Set[str]:
+    return {
+        value.strip().casefold()
+        for value in os.getenv("HERMES_HIDDEN_SKILL_PREFIXES", "")
+        .replace("\n", ",")
+        .split(",")
+        if value.strip()
+    }
+
+
+def _is_hidden_skill_name(value: object) -> bool:
+    name = str(value or "").strip().replace("\\", "/")
+    if not name:
+        return False
+    candidates = {
+        name.casefold(),
+        name.rsplit("/", 1)[-1].casefold(),
+        name.rsplit(":", 1)[-1].casefold(),
+    }
+    if not candidates.isdisjoint(_hidden_skill_names()):
+        return True
+    return any(
+        candidate.startswith(prefix)
+        for candidate in candidates
+        for prefix in _hidden_skill_prefixes()
+    )
+
+
 def load_env() -> Dict[str, str]:
     """Load profile-scoped environment variables from HERMES_HOME/.env."""
     env_path = get_hermes_home() / ".env"
@@ -586,6 +622,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     continue
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+                if _is_hidden_skill_name(name):
+                    continue
                 if name in seen_names:
                     continue
                 if name in disabled:
@@ -868,6 +906,15 @@ def skill_view(
         JSON string with skill content or error message
     """
     try:
+        if _is_hidden_skill_name(name):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Skill '{name}' not found.",
+                    "hint": "Use skills_list to see available skills",
+                },
+                ensure_ascii=False,
+            )
         local_category_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
@@ -1564,4 +1611,3 @@ registry.register(
     check_fn=check_skills_requirements,
     emoji="📚",
 )
-

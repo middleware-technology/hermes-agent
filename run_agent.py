@@ -288,7 +288,9 @@ class IterationBudget:
     """Thread-safe iteration counter for an agent.
 
     Each agent (parent or subagent) gets its own ``IterationBudget``.
-    The parent's budget is capped at ``max_iterations`` (default 90).
+    The parent's budget is capped at ``max_iterations`` (default 90). A
+    ``None`` maximum is deliberately unbounded; callers that choose it are
+    expected to provide their own progress/inactivity supervision.
     Each subagent gets an independent budget capped at
     ``delegation.max_iterations`` (default 50) — this means total
     iterations across parent + subagents can exceed the parent's cap.
@@ -299,7 +301,7 @@ class IterationBudget:
     :meth:`refund` so they don't eat into the budget.
     """
 
-    def __init__(self, max_total: int):
+    def __init__(self, max_total: int | None):
         self.max_total = max_total
         self._used = 0
         self._lock = threading.Lock()
@@ -307,7 +309,7 @@ class IterationBudget:
     def consume(self) -> bool:
         """Try to consume one iteration.  Returns True if allowed."""
         with self._lock:
-            if self._used >= self.max_total:
+            if self.max_total is not None and self._used >= self.max_total:
                 return False
             self._used += 1
             return True
@@ -324,9 +326,16 @@ class IterationBudget:
             return self._used
 
     @property
-    def remaining(self) -> int:
+    def remaining(self) -> int | None:
         with self._lock:
+            if self.max_total is None:
+                return None
             return max(0, self.max_total - self._used)
+
+    @property
+    def exhausted(self) -> bool:
+        with self._lock:
+            return self.max_total is not None and self._used >= self.max_total
 
 
 # Tools that must never run concurrently (interactive / user-facing).
@@ -1129,7 +1138,7 @@ class AIAgent:
         command: str = None,
         args: list[str] | None = None,
         model: str = "",
-        max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+        max_iterations: int | None = 90,  # None disables the per-turn iteration ceiling.
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -1194,7 +1203,8 @@ class AIAgent:
             provider (str): Provider identifier (optional; used for telemetry/routing hints)
             api_mode (str): API mode override: "chat_completions" or "codex_responses"
             model (str): Model name to use (default: "anthropic/claude-opus-4.6")
-            max_iterations (int): Maximum number of tool calling iterations (default: 90)
+            max_iterations (int | None): Maximum number of tool-calling iterations;
+                None disables the per-turn ceiling (default: 90)
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
             enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
             disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
@@ -1236,6 +1246,10 @@ class AIAgent:
         _install_safe_stdio()
 
         self.model = model
+        if max_iterations is not None:
+            max_iterations = int(max_iterations)
+            if max_iterations <= 0:
+                raise ValueError("max_iterations must be positive or None")
         self.max_iterations = max_iterations
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
@@ -12272,7 +12286,13 @@ class AIAgent:
                 should_review_memory=_should_review_memory,
             )
 
-        while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
+        while (
+            (
+                (self.max_iterations is None or api_call_count < self.max_iterations)
+                and not self.iteration_budget.exhausted
+            )
+            or self._budget_grace_call
+        ):
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
@@ -15415,7 +15435,10 @@ class AIAgent:
                 # role-alternation invariants.
 
                 # If we're near the limit, break to avoid infinite loops
-                if api_call_count >= self.max_iterations - 1:
+                if (
+                    self.max_iterations is not None
+                    and api_call_count >= self.max_iterations - 1
+                ):
                     _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
                     # Append as assistant so the history stays valid for
@@ -15423,10 +15446,7 @@ class AIAgent:
                     messages.append({"role": "assistant", "content": final_response})
                     break
         
-        if final_response is None and (
-            api_call_count >= self.max_iterations
-            or self.iteration_budget.remaining <= 0
-        ):
+        if final_response is None and self.iteration_budget.exhausted:
             # Budget exhausted — ask the model for a summary via one extra
             # API call with tools stripped.  _handle_max_iterations injects a
             # user message and makes a single toolless request.
@@ -15477,7 +15497,7 @@ class AIAgent:
                     )
 
         # Determine if conversation completed successfully
-        completed = final_response is not None and api_call_count < self.max_iterations
+        completed = final_response is not None and not self.iteration_budget.exhausted
 
         # Save trajectory if enabled.  ``user_message`` may be a multimodal
         # list of parts; the trajectory format wants a plain string.
@@ -15515,14 +15535,18 @@ class AIAgent:
         _resp_len = len(final_response) if final_response else 0
         _budget_used = self.iteration_budget.used if self.iteration_budget else 0
         _budget_max = self.iteration_budget.max_total if self.iteration_budget else 0
+        _max_iterations_display = (
+            self.max_iterations if self.max_iterations is not None else "unbounded"
+        )
+        _budget_max_display = _budget_max if _budget_max is not None else "unbounded"
 
         _diag_msg = (
-            "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
+            "Turn ended: reason=%s model=%s api_calls=%d/%s budget=%d/%s "
             "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
         )
         _diag_args = (
-            _turn_exit_reason, self.model, api_call_count, self.max_iterations,
-            _budget_used, _budget_max,
+            _turn_exit_reason, self.model, api_call_count, _max_iterations_display,
+            _budget_used, _budget_max_display,
             _turn_tool_count, _last_msg_role, _resp_len,
             self.session_id or "none",
         )

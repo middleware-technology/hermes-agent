@@ -26,6 +26,53 @@ from typing import Callable, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 
+# Babel's Action Board boundary is evaluated in the host runtime's
+# ``tool_start_callback`` before Hermes dispatches the call.  A rejected call
+# must still become a normal tool result so the model can correct its
+# arguments, but a JSON field supplied by the model must never be able to
+# manufacture that authority.  Keep the capability process-local and consume
+# it exactly once at the central dispatch boundary.
+_BABEL_ACTION_BOARD_REJECTION_KEY = "__babel_action_board_boundary_rejection"
+_BABEL_ACTION_BOARD_REJECTION_SENTINEL = object()
+_BABEL_ACTION_BOARD_REJECTION_REASON_MAX_CHARS = 512
+
+
+def mark_babel_action_board_boundary_rejection(args: dict, reason: str) -> None:
+    """Mark one argument mapping as rejected by Babel's trusted boundary."""
+
+    if not isinstance(args, dict):
+        raise TypeError("tool arguments must be a dictionary")
+    bounded_reason = str(reason or "Tool arguments violate the Action Board boundary.").strip()
+    if not bounded_reason:
+        bounded_reason = "Tool arguments violate the Action Board boundary."
+    args[_BABEL_ACTION_BOARD_REJECTION_KEY] = (
+        _BABEL_ACTION_BOARD_REJECTION_SENTINEL,
+        bounded_reason[:_BABEL_ACTION_BOARD_REJECTION_REASON_MAX_CHARS],
+    )
+
+
+def _consume_babel_action_board_boundary_rejection(args: dict) -> str | None:
+    """Pop and authenticate Babel's one-shot rejection capability.
+
+    The reserved key is removed even when its value was forged through the
+    public JSON tool arguments.  Only object identity created in this process
+    can activate the rejection path.
+    """
+
+    if not isinstance(args, dict):
+        return None
+    marker = args.pop(_BABEL_ACTION_BOARD_REJECTION_KEY, None)
+    if (
+        isinstance(marker, tuple)
+        and len(marker) == 2
+        and marker[0] is _BABEL_ACTION_BOARD_REJECTION_SENTINEL
+        and isinstance(marker[1], str)
+        and marker[1]
+    ):
+        return marker[1][:_BABEL_ACTION_BOARD_REJECTION_REASON_MAX_CHARS]
+    return None
+
+
 def _is_registry_register_call(node: ast.AST) -> bool:
     """Return True when *node* is a ``registry.register(...)`` call expression."""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
@@ -377,6 +424,17 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        boundary_rejection = _consume_babel_action_board_boundary_rejection(args)
+        if boundary_rejection is not None:
+            return json.dumps(
+                {
+                    "error": "Action Board boundary rejected this tool call.",
+                    "code": "action_board_boundary_rejected",
+                    "reason": boundary_rejection,
+                },
+                ensure_ascii=False,
+            )
+
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})

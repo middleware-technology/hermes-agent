@@ -749,9 +749,10 @@ class GitHubSource(SkillSource):
 # ---------------------------------------------------------------------------
 
 class WellKnownSkillSource(SkillSource):
-    """Read skills from a domain exposing /.well-known/skills/index.json."""
+    """Read skills from current or legacy Agent Skills well-known endpoints."""
 
-    BASE_PATH = "/.well-known/skills"
+    BASE_PATH = "/.well-known/agent-skills"
+    LEGACY_BASE_PATH = "/.well-known/skills"
 
     def source_id(self) -> str:
         return "well-known"
@@ -760,11 +761,11 @@ class WellKnownSkillSource(SkillSource):
         return "community"
 
     def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
-        index_url = self._query_to_index_url(query)
-        if not index_url:
-            return []
-
-        parsed = self._parse_index(index_url)
+        parsed = None
+        for index_url in self._query_to_index_urls(query):
+            parsed = self._parse_index(index_url)
+            if parsed:
+                break
         if not parsed:
             return []
 
@@ -875,16 +876,25 @@ class WellKnownSkillSource(SkillSource):
             },
         )
 
-    def _query_to_index_url(self, query: str) -> Optional[str]:
+    def _query_to_index_urls(self, query: str) -> List[str]:
         query = query.strip()
         if not query.startswith(("http://", "https://")):
-            return None
+            return []
         if query.endswith("/index.json"):
-            return query
-        if f"{self.BASE_PATH}/" in query:
-            base_url = query.split(f"{self.BASE_PATH}/", 1)[0] + self.BASE_PATH
-            return f"{base_url}/index.json"
-        return query.rstrip("/") + f"{self.BASE_PATH}/index.json"
+            return [query]
+        for base_path in (self.BASE_PATH, self.LEGACY_BASE_PATH):
+            if f"{base_path}/" in query:
+                base_url = query.split(f"{base_path}/", 1)[0] + base_path
+                return [f"{base_url}/index.json"]
+        root = query.rstrip("/")
+        return [
+            f"{root}{self.BASE_PATH}/index.json",
+            f"{root}{self.LEGACY_BASE_PATH}/index.json",
+        ]
+
+    def _query_to_index_url(self, query: str) -> Optional[str]:
+        urls = self._query_to_index_urls(query)
+        return urls[0] if urls else None
 
     def _parse_identifier(self, identifier: str) -> Optional[dict]:
         raw = identifier[len("well-known:"):] if identifier.startswith("well-known:") else identifier
@@ -913,7 +923,10 @@ class WellKnownSkillSource(SkillSource):
         else:
             skill_url = clean_url.rstrip("/")
 
-        if f"{self.BASE_PATH}/" not in skill_url:
+        if not any(
+            f"{base_path}/" in skill_url
+            for base_path in (self.BASE_PATH, self.LEGACY_BASE_PATH)
+        ):
             return None
 
         base_url, skill_name = skill_url.rsplit("/", 1)
@@ -1012,7 +1025,11 @@ class UrlSource(SkillSource):
         if not ident.lower().startswith(("http://", "https://")):
             return False
         # Don't steal well-known URLs.
-        if "/.well-known/skills/" in ident or ident.rstrip("/").endswith("/index.json"):
+        if (
+            "/.well-known/agent-skills/" in ident
+            or "/.well-known/skills/" in ident
+            or ident.rstrip("/").endswith("/index.json")
+        ):
             return False
         # Only claim URLs that look like a markdown file.
         try:

@@ -508,12 +508,15 @@ def _element_to_dict(e: UIElement) -> Dict[str, Any]:
 def check_computer_use_requirements() -> bool:
     """Return True iff computer_use can run on this host.
 
-    Conditions: macOS + cua-driver binary installed (or override via env).
+    Conditions: macOS + cua-driver binary + Python MCP client.
     """
     if sys.platform != "darwin":
         return False
-    from tools.computer_use.cua_backend import cua_driver_binary_available
-    return cua_driver_binary_available()
+    from tools.computer_use.cua_backend import (
+        cua_driver_binary_available,
+        mcp_client_available,
+    )
+    return cua_driver_binary_available() and mcp_client_available()
 
 
 def get_computer_use_schema() -> Dict[str, Any]:

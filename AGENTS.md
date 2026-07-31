@@ -94,7 +94,7 @@ class AIAgent:
         provider: str = None,
         api_mode: str = None,              # "chat_completions" | "codex_responses" | ...
         model: str = "",                   # empty → resolved from config/provider later
-        max_iterations: int = 90,          # tool-calling iterations (shared with subagents)
+        max_iterations: int | None = 90,   # None disables the per-turn ceiling
         enabled_toolsets: list = None,
         disabled_toolsets: list = None,
         quiet_mode: bool = False,
@@ -122,7 +122,8 @@ The core loop is inside `run_conversation()` — entirely synchronous, with
 interrupt checks, budget tracking, and a one-turn grace call:
 
 ```python
-while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) \
+while ((self.max_iterations is None or api_call_count < self.max_iterations) \
+       and not self.iteration_budget.exhausted) \
         or self._budget_grace_call:
     if self._interrupt_requested: break
     response = client.chat.completions.create(model=model, messages=messages, tools=tool_schemas)

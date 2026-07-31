@@ -578,6 +578,10 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    # Optional ownership fence used by external orchestrators. Supplying both
+    # values guarantees that a delayed completion cannot close a newer retry.
+    expected_run_id: Optional[int] = None
+    expected_claim_lock: Optional[str] = None
 
 
 @router.patch("/tasks/{task_id}")
@@ -610,9 +614,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    expected_run_id=payload.expected_run_id,
+                    expected_claim_lock=payload.expected_claim_lock,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                ok = kanban_db.block_task(
+                    conn,
+                    task_id,
+                    reason=payload.block_reason,
+                    expected_run_id=payload.expected_run_id,
+                    expected_claim_lock=payload.expected_claim_lock,
+                )
             elif s == "ready":
                 # Re-open a blocked task, or just an explicit status set.
                 current = kanban_db.get_task(conn, task_id)

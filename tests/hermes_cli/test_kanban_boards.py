@@ -133,6 +133,19 @@ class TestPathResolution:
         assert kb.kanban_db_path() == forced
         assert kb.kanban_db_path(board="ignored") == forced
 
+    def test_babel_host_can_address_named_board_under_db_override(
+        self, fresh_home, tmp_path, monkeypatch
+    ):
+        """Babel's host can orchestrate a board other than the worker pin."""
+        forced = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        monkeypatch.setenv("BABEL_HERMES_HOME", str(fresh_home))
+
+        assert kb.kanban_db_path() == forced
+        assert kb.kanban_db_path(board="named") == (
+            fresh_home / "kanban" / "boards" / "named" / "kanban.db"
+        )
+
     def test_env_var_workspaces_override(self, fresh_home, tmp_path, monkeypatch):
         forced = tmp_path / "ws"
         monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(forced))

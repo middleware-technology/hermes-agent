@@ -98,6 +98,10 @@ class TestCheckSensitivePathMacOSBypass:
         from tools.file_tools import _check_sensitive_path
         assert _check_sensitive_path("/private/var/db/something") is not None
 
+    def test_current_user_temp_path_allowed(self, tmp_path: Path):
+        from tools.file_tools import _check_sensitive_path
+        assert _check_sensitive_path(str(tmp_path / "safe_file.txt")) is None
+
     def test_boot_still_blocked(self):
         from tools.file_tools import _check_sensitive_path
         assert _check_sensitive_path("/boot/grub/grub.cfg") is not None

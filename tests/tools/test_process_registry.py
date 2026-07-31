@@ -866,6 +866,23 @@ class TestProcessToolHandler:
         result = json.loads(_handle_process({"action": "unknown_action"}))
         assert "error" in result
 
+    def test_process_session_is_not_visible_across_task_boundaries(self):
+        from tools.process_registry import _handle_process, process_registry
+
+        session = _make_session(sid="proc_task_owned", task_id="task-owner")
+        with patch.object(process_registry, "get", return_value=session), \
+             patch.object(process_registry, "poll") as poll:
+            result = json.loads(
+                _handle_process(
+                    {"action": "poll", "session_id": session.id},
+                    task_id="task-other",
+                )
+            )
+
+        assert "error" in result
+        assert session.id in result["error"]
+        poll.assert_not_called()
+
 
 # =========================================================================
 # format_process_notification + drain_notifications (shared helpers)

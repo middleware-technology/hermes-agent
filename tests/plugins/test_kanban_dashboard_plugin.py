@@ -331,6 +331,55 @@ def test_patch_status_running_rejected(client):
     assert statuses.get(t["id"]) != "running"
 
 
+def test_patch_terminal_status_rejects_stale_claim_owner(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "fenced", "assignee": "worker"},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        first = kb.claim_task(conn, task["id"], claimer="babel:first")
+        assert first is not None
+        run_one = first.current_run_id
+        assert run_one is not None
+        assert kb.reclaim_task(conn, task["id"], reason="retry")
+        second = kb.claim_task(conn, task["id"], claimer="babel:second")
+        assert second is not None
+        run_two = second.current_run_id
+        assert run_two is not None and run_two != run_one
+    finally:
+        conn.close()
+
+    stale = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "done",
+            "summary": "late result",
+            "expected_run_id": run_one,
+            "expected_claim_lock": "babel:first",
+        },
+    )
+    assert stale.status_code == 409
+    detail = client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()["task"]
+    assert detail["status"] == "running"
+    assert detail["current_run_id"] == run_two
+    assert detail["claim_lock"] == "babel:second"
+
+    current = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "done",
+            "summary": "current result",
+            "expected_run_id": run_two,
+            "expected_claim_lock": "babel:second",
+        },
+    )
+    assert current.status_code == 200
+    assert current.json()["task"]["status"] == "done"
+
+
 # ---------------------------------------------------------------------------
 # Comments + Links
 # ---------------------------------------------------------------------------

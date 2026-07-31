@@ -91,6 +91,14 @@ class TestJobScriptField:
 class TestRunJobScript:
     """Test the _run_job_script() function."""
 
+    def test_default_timeout_allows_long_collection_scripts(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        monkeypatch.delenv("HERMES_CRON_SCRIPT_TIMEOUT", raising=False)
+        monkeypatch.setattr(sched_mod, "load_config", lambda: {})
+
+        assert sched_mod._get_script_timeout() == 3600
+
     def test_successful_script(self, cron_env):
         from cron.scheduler import _run_job_script
 

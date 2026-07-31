@@ -94,6 +94,18 @@ class TestRegistration:
         if sys.platform != "darwin":
             assert entry.check_fn() is False
 
+    def test_check_fn_requires_python_mcp_client(self):
+        from tools.computer_use.tool import check_computer_use_requirements
+
+        with patch.object(sys, "platform", "darwin"), patch(
+            "tools.computer_use.cua_backend.cua_driver_binary_available",
+            return_value=True,
+        ), patch(
+            "tools.computer_use.cua_backend.mcp_client_available",
+            return_value=False,
+        ):
+            assert check_computer_use_requirements() is False
+
 
 # ---------------------------------------------------------------------------
 # Dispatch & action routing
