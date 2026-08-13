@@ -130,6 +130,10 @@ lsp:
   wait_mode: document      # "document" or "full"
   wait_timeout: 5.0
 
+  # Stop an unused workspace server after this many seconds to release its
+  # index from RAM. The next edit starts it again. Set to 0 to keep it alive.
+  idle_timeout: 300
+
   # How to handle missing server binaries.
   #   auto    — install via npm/pip/go install into <HERMES_HOME>/lsp/bin
   #   manual  — only use binaries already on PATH
@@ -186,9 +190,11 @@ budget is `wait_timeout` seconds — typically the server responds in
 tens of milliseconds for pyright/tsserver and a few seconds for
 rust-analyzer mid-indexing.
 
-Servers are kept alive for the life of the Hermes process. There's
-no idle-timeout reaper — the cost of restarting the server's index
-on every write would be far higher than holding the daemon.
+Servers are reused while edits are active, then stopped after
+`idle_timeout` seconds without a file operation (five minutes by default).
+This releases workspace indexes held by Pyright, `tsserver`, and similar
+processes. The next matching edit starts a fresh server. Set `idle_timeout: 0`
+to keep servers alive for the life of the Hermes process instead.
 
 ## Disabling
 

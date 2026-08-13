@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -92,6 +93,19 @@ def test_service_returns_empty_when_disabled(tmp_path):
     svc.shutdown()
 
 
+def test_service_reads_idle_timeout_from_config(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"lsp": {"enabled": False, "idle_timeout": 42}},
+    )
+    svc = LSPService.create_from_config()
+    assert svc is not None
+    try:
+        assert svc.get_status()["idle_timeout"] == 42.0
+    finally:
+        svc.shutdown()
+
+
 def test_service_skips_files_outside_workspace(tmp_path):
     """Files outside any git worktree must not trigger LSP."""
     svc = LSPService(
@@ -173,6 +187,65 @@ def test_service_status_includes_clients(mock_pyright):
         svc.get_diagnostics_sync(str(f))
         info = svc.get_status()
         assert info["enabled"] is True
+        assert info["idle_timeout"] == 300.0
         assert any(c["server_id"] == "pyright" for c in info["clients"])
+    finally:
+        svc.shutdown()
+
+
+def test_idle_reaper_stops_client_and_next_edit_respawns(mock_pyright):
+    repo = mock_pyright
+    f = repo / "x.py"
+    f.write_text("print('hi')\n")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+        idle_timeout=0.15,
+    )
+    try:
+        svc.get_diagnostics_sync(str(f))
+        with svc._state_lock:
+            first_client = next(iter(svc._clients.values()))
+            assert first_client._proc is not None
+            first_pid = first_client._proc.pid
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if not svc.get_status()["clients"]:
+                try:
+                    os.kill(first_pid, 0)
+                except ProcessLookupError:
+                    break
+            time.sleep(0.02)
+        else:
+            pytest.fail("idle LSP client was not stopped")
+
+        assert svc.get_status()["clients"] == []
+        svc.get_diagnostics_sync(str(f))
+        with svc._state_lock:
+            second_client = next(iter(svc._clients.values()))
+            assert second_client._proc is not None
+            assert second_client._proc.pid != first_pid
+    finally:
+        svc.shutdown()
+
+
+def test_idle_timeout_zero_keeps_client_alive(mock_pyright):
+    repo = mock_pyright
+    f = repo / "x.py"
+    f.write_text("print('hi')\n")
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+        idle_timeout=0,
+    )
+    try:
+        svc.get_diagnostics_sync(str(f))
+        time.sleep(0.2)
+        assert len(svc.get_status()["clients"]) == 1
     finally:
         svc.shutdown()

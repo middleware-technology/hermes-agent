@@ -304,6 +304,7 @@ class TestSkillsList:
             raw = skills_list()
         result = json.loads(raw)
         assert result["count"] == 2
+        assert result["callable_names"] == ["alpha", "beta"]
 
     def test_category_filter(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -338,6 +339,19 @@ class TestSkillsList:
 
 
 class TestSkillView:
+    def test_category_name_is_not_advertised_as_callable_skill(self, tmp_path):
+        category = tmp_path / "babel-workflow"
+        category.mkdir()
+        _make_skill(tmp_path, "development-loop", category="babel-workflow")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            raw = skill_view("babel-workflow")
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert result["code"] == "skill_category_not_callable"
+        assert result["available_skills"] == ["development-loop"]
+
     def test_view_existing_skill(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "my-skill")

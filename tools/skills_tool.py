@@ -767,8 +767,12 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 "success": True,
                 "skills": all_skills,
                 "categories": categories,
+                "callable_names": [skill["name"] for skill in all_skills],
                 "count": len(all_skills),
-                "hint": "Use skill_view(name) to see full content, tags, and linked files",
+                "hint": (
+                    "Only values from callable_names (or skills[].name) are valid "
+                    "skill_view names. Categories are filters, not callable skills."
+                ),
             },
             ensure_ascii=False,
         )
@@ -912,6 +916,28 @@ def skill_view(
                     "success": False,
                     "error": f"Skill '{name}' not found.",
                     "hint": "Use skills_list to see available skills",
+                },
+                ensure_ascii=False,
+            )
+        category_dir = SKILLS_DIR / str(name).strip()
+        if category_dir.is_dir() and not (category_dir / "SKILL.md").is_file():
+            available = [
+                skill["name"]
+                for skill in _find_all_skills()
+                if skill.get("category") == str(name).strip()
+            ]
+            return json.dumps(
+                {
+                    "success": False,
+                    "code": "skill_category_not_callable",
+                    "error": (
+                        f"'{name}' is a skill category, not a callable skill."
+                    ),
+                    "available_skills": available,
+                    "hint": (
+                        "Call skill_view with a value from skills_list()."
+                        "callable_names."
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -1536,7 +1562,11 @@ if __name__ == "__main__":
 
 SKILLS_LIST_SCHEMA = {
     "name": "skills_list",
-    "description": "List available skills (name + description). Use skill_view(name) to load full content.",
+    "description": (
+        "List available skills (name + description). Only callable_names or "
+        "skills[].name values may be passed to skill_view; category values are "
+        "filters, not skills."
+    ),
     "parameters": {
         "type": "object",
         "properties": {

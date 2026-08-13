@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, unquote
@@ -248,6 +249,11 @@ class LSPClient:
         env = dict(os.environ)
         if self._env:
             env.update(self._env)
+        process_options: Dict[str, Any] = {}
+        if os.name == "posix":
+            # Isolate each language server and its workers (for example the
+            # two tsserver children) so cleanup can reclaim the entire tree.
+            process_options["start_new_session"] = True
 
         try:
             self._proc = await asyncio.create_subprocess_exec(
@@ -258,6 +264,7 @@ class LSPClient:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=self._cwd,
+                **process_options,
             )
         except FileNotFoundError as e:
             raise LSPProtocolError(
@@ -408,9 +415,21 @@ class LSPClient:
                     pass
         finally:
             self._state = "stopped"
-            await self._cleanup_process()
+            await self._cleanup_process(graceful=True)
 
-    async def _cleanup_process(self) -> None:
+    async def _cleanup_process(self, *, graceful: bool = False) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is not None:
+            if graceful and proc.returncode is None:
+                # Give the LSP shutdown/exit handshake time to let the server
+                # dispose its own workers before escalating to OS signals.
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+                except asyncio.TimeoutError:
+                    pass
+            await self._terminate_process_tree(proc)
+
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
             try:
@@ -423,21 +442,67 @@ class LSPClient:
                 await self._stderr_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        proc = self._proc
-        self._proc = None
-        if proc is None:
-            return
-        if proc.returncode is None:
-            try:
-                proc.terminate()
+
+    async def _terminate_process_tree(self, proc: asyncio.subprocess.Process) -> None:
+        """Terminate the server and every worker it spawned.
+
+        POSIX servers are started in their own session, so signalling their
+        process group also catches descendants that survive the LSP ``exit``
+        notification.  Other platforms retain the direct-process fallback.
+        """
+        if os.name != "posix":
+            if proc.returncode is None:
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                except asyncio.TimeoutError:
+                    proc.terminate()
                     try:
+                        await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+                    except asyncio.TimeoutError:
                         proc.kill()
                         await proc.wait()
-                    except ProcessLookupError:
-                        pass
+                except ProcessLookupError:
+                    pass
+            return
+
+        process_group = proc.pid
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            # The group leader may have exited and been reparented between
+            # the graceful wait and this probe. Fall back to the direct child
+            # if it is still ours; otherwise there is nothing more we can
+            # safely signal.
+            if proc.returncode is not None:
+                return
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                return
+
+        if proc.returncode is None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+            except asyncio.TimeoutError:
+                pass
+
+        deadline = asyncio.get_running_loop().time() + SHUTDOWN_GRACE
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                return
+            await asyncio.sleep(0.05)
+
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        if proc.returncode is None:
+            try:
+                await proc.wait()
             except ProcessLookupError:
                 pass
 

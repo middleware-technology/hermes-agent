@@ -1546,6 +1546,11 @@ DEFAULT_CONFIG = {
         "wait_mode": "document",
         "wait_timeout": 5.0,
 
+        # Release language-server workspace indexes after five minutes
+        # without a file operation.  A later edit starts the server again.
+        # Set to 0 to retain servers for the full Hermes process lifetime.
+        "idle_timeout": 300.0,
+
         # How to handle missing server binaries.
         # ``"auto"`` — try to install via npm/go/pip into
         #              ``<HERMES_HOME>/lsp/bin/`` on first use.
