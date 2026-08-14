@@ -15670,6 +15670,29 @@ class AIAgent:
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
         }
+        delegated_usage = {
+            "input_tokens": int(getattr(self, "session_delegated_input_tokens", 0) or 0),
+            "output_tokens": int(getattr(self, "session_delegated_output_tokens", 0) or 0),
+            "cache_read_tokens": int(getattr(self, "session_delegated_cache_read_tokens", 0) or 0),
+            "cache_write_tokens": int(getattr(self, "session_delegated_cache_write_tokens", 0) or 0),
+            "reasoning_tokens": int(getattr(self, "session_delegated_reasoning_tokens", 0) or 0),
+            "total_tokens": int(getattr(self, "session_delegated_total_tokens", 0) or 0),
+            "api_call_count": int(getattr(self, "session_delegated_api_calls", 0) or 0),
+        }
+        result["api_call_count"] = int(self.session_api_calls or 0)
+        result["billing_mode"] = (
+            "subscription_included" if self.session_cost_status == "included" else None
+        )
+        result["delegated_usage"] = delegated_usage
+        result["inclusive_usage"] = {
+            "input_tokens": int(self.session_input_tokens or 0) + delegated_usage["input_tokens"],
+            "output_tokens": int(self.session_output_tokens or 0) + delegated_usage["output_tokens"],
+            "cache_read_tokens": int(self.session_cache_read_tokens or 0) + delegated_usage["cache_read_tokens"],
+            "cache_write_tokens": int(self.session_cache_write_tokens or 0) + delegated_usage["cache_write_tokens"],
+            "reasoning_tokens": int(self.session_reasoning_tokens or 0) + delegated_usage["reasoning_tokens"],
+            "total_tokens": int(self.session_total_tokens or 0) + delegated_usage["total_tokens"],
+            "api_call_count": int(self.session_api_calls or 0) + delegated_usage["api_call_count"],
+        }
         if self._tool_guardrail_halt_decision is not None:
             result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
         # If a /steer landed after the final assistant turn (no more tool

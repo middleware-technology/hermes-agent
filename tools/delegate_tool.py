@@ -1684,6 +1684,37 @@ def _run_single_child(
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
 
+        _inclusive_usage = result.get("inclusive_usage")
+        if not isinstance(_inclusive_usage, dict):
+            _inclusive_usage = {
+                "input_tokens": getattr(child, "session_input_tokens", _input_tokens),
+                "output_tokens": getattr(child, "session_output_tokens", _output_tokens),
+                "cache_read_tokens": getattr(child, "session_cache_read_tokens", 0),
+                "cache_write_tokens": getattr(child, "session_cache_write_tokens", 0),
+                "reasoning_tokens": getattr(child, "session_reasoning_tokens", 0),
+                "total_tokens": getattr(child, "session_total_tokens", 0),
+                "api_call_count": getattr(child, "session_api_calls", api_calls),
+            }
+        _child_usage = {
+            "input_tokens": int(_inclusive_usage.get("input_tokens") or 0),
+            "output_tokens": int(_inclusive_usage.get("output_tokens") or 0),
+            "cached_input_tokens": int(_inclusive_usage.get("cache_read_tokens") or 0),
+            "cache_write_tokens": int(_inclusive_usage.get("cache_write_tokens") or 0),
+            "reasoning_tokens": int(_inclusive_usage.get("reasoning_tokens") or 0),
+            "total_tokens": int(_inclusive_usage.get("total_tokens") or 0),
+            "api_call_count": int(_inclusive_usage.get("api_call_count") or api_calls or 0),
+            "model": _model if isinstance(_model, str) else None,
+            "provider": (
+                getattr(child, "provider", None)
+                if isinstance(getattr(child, "provider", None), str)
+                else None
+            ),
+            "billing_mode": result.get("billing_mode"),
+            "cost_status": result.get("cost_status"),
+            "cost_source": result.get("cost_source"),
+            "provenance": "hermes_delegate_child_result",
+        }
+
         entry: Dict[str, Any] = {
             "task_index": task_index,
             "status": status,
@@ -1700,6 +1731,7 @@ def _run_single_child(
                     _output_tokens if isinstance(_output_tokens, (int, float)) else 0
                 ),
             },
+            "usage": _child_usage,
             "tool_trace": tool_trace,
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
@@ -2253,6 +2285,15 @@ def delegate_task(
     # closed; we fold them into the parent in one pass alongside the
     # subagent_stop hook loop so we don't walk `results` twice.
     _children_cost_total = 0.0
+    _delegated_usage_totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0,
+        "api_call_count": 0,
+    }
     for entry in results:
         child_role = entry.pop("_child_role", None)
         child_cost = entry.pop("_child_cost_usd", 0.0)
@@ -2261,6 +2302,12 @@ def delegate_task(
                 _children_cost_total += float(child_cost)
         except (TypeError, ValueError):
             pass
+        child_usage = entry.get("usage")
+        if isinstance(child_usage, dict):
+            for key in _delegated_usage_totals:
+                value = child_usage.get(key)
+                if isinstance(value, (int, float)):
+                    _delegated_usage_totals[key] += max(0, int(value))
         if _invoke_hook is None:
             continue
         try:
@@ -2296,6 +2343,20 @@ def delegate_task(
                 parent_agent.session_cost_status = "estimated"
         except Exception:
             logger.debug("Subagent cost rollup failed", exc_info=True)
+
+    if parent_agent is not None:
+        _parent_usage_attrs = {
+            "input_tokens": "session_delegated_input_tokens",
+            "output_tokens": "session_delegated_output_tokens",
+            "cached_input_tokens": "session_delegated_cache_read_tokens",
+            "cache_write_tokens": "session_delegated_cache_write_tokens",
+            "reasoning_tokens": "session_delegated_reasoning_tokens",
+            "total_tokens": "session_delegated_total_tokens",
+            "api_call_count": "session_delegated_api_calls",
+        }
+        for key, attr in _parent_usage_attrs.items():
+            current = int(getattr(parent_agent, attr, 0) or 0)
+            setattr(parent_agent, attr, current + _delegated_usage_totals[key])
 
     total_duration = round(time.monotonic() - overall_start, 2)
 
