@@ -531,6 +531,48 @@ def _scoped_mutation_first_read_limit() -> int:
     return max(2, min(requested, 16))
 
 
+def _scoped_mutation_recovery_read_limit(override: int | None = None) -> int:
+    """Bound distinct evidence reads in a mutation-recovery segment.
+
+    A controller-owned verification failure can identify a coherent repair
+    spanning a manifest, configuration, and implementation file.  Treating
+    the second *distinct* read as no progress stopped those repairs before
+    the worker could make a mutation.  Repeated reads of one path are still
+    halted separately; this aggregate limit only bounds useful, distinct
+    evidence gathering.
+    """
+
+    if override is not None:
+        try:
+            return max(1, min(int(override), 8))
+        except (TypeError, ValueError):
+            pass
+    raw = os.getenv("BABEL_ACTION_BOARD_RECOVERY_READ_LIMIT", "8")
+    try:
+        requested = int(raw) if raw.strip() else 8
+    except (TypeError, ValueError):
+        requested = 8
+    return max(2, min(requested, 8))
+
+
+def _scoped_mutation_recovery_repeat_path_limit() -> int:
+    """Allow one deduplicated reread redirect before halting a repair.
+
+    Providers occasionally request the grounding file once more after reading
+    adjacent configuration. The file tool already returns an explicit
+    ``unchanged`` result for that second request. Giving the model one turn to
+    react to that redirect is cheaper than terminating the session and
+    rebuilding the repair prompt; a third request is unambiguous loop evidence.
+    """
+
+    raw = os.getenv("BABEL_ACTION_BOARD_RECOVERY_REPEAT_PATH_LIMIT", "3")
+    try:
+        requested = int(raw) if raw.strip() else 3
+    except (TypeError, ValueError):
+        requested = 3
+    return max(2, min(requested, 4))
+
+
 def _should_parallelize_tool_batch(tool_calls) -> bool:
     """Return True when a tool-call batch is safe to run concurrently."""
     if len(tool_calls) <= 1:
@@ -1512,6 +1554,13 @@ class AIAgent:
         self._scoped_mutation_path_counts: dict[str, int] = {}
         self._scoped_mutation_progress_count = 0
         self._scoped_mutation_recovery = False
+        # Babel may explicitly ask a bounded repair worker to return control
+        # immediately after the model's current tool-call batch makes a real
+        # mutation. Keep this separate from the aggregate mutation limit: a
+        # provider can emit several coherent writes in one response, but it
+        # must not receive another inference turn in which the compact repair
+        # objective can be forgotten and replaced by fresh inventory.
+        self._scoped_checkpoint_after_mutation_batch = False
         # This flag protects unattended workers from truncated structured
         # mutations without imposing mutation-only recovery semantics on a
         # normal first turn.  It is deliberately independent from
@@ -1523,6 +1572,8 @@ class AIAgent:
         self._scoped_mutation_first_block_counts: dict[str, int] = {}
         self._scoped_disabled_mutation_paths: set[str] = set()
         self._scoped_recovery_read_calls = 0
+        self._scoped_recovery_read_path_counts: dict[str, int] = {}
+        self._scoped_recovery_read_limit_override: int | None = None
         self._scoped_verification_read_path_counts: dict[str, int] = {}
         self._scoped_exact_terminal_command: str | None = None
         self._scoped_verification_terminal_calls = 0
@@ -6549,6 +6600,7 @@ class AIAgent:
                 "compacted_message_count": 0,
                 "dropped_message_count": 0,
                 "pruned_tool_result_count": 0,
+                "execution_ledger_applied": False,
                 "provenance": "provider_input_copy_only",
             }
             return messages
@@ -6579,12 +6631,18 @@ class AIAgent:
                 + value[-tail:]
             )
 
-        def compact_message(message: Dict[str, Any]) -> Dict[str, Any]:
+        def compact_message(
+            message: Dict[str, Any],
+            *,
+            content_limit: int = 840,
+        ) -> Dict[str, Any]:
             compacted = copy.deepcopy(message)
             if compacted.get("role") == "tool":
                 compacted["content"] = compact_text(compacted.get("content"), limit=560)
             elif isinstance(compacted.get("content"), str):
-                compacted["content"] = compact_text(compacted.get("content"), limit=840)
+                compacted["content"] = compact_text(
+                    compacted.get("content"), limit=content_limit
+                )
             elif isinstance(compacted.get("content"), list):
                 parts = []
                 for part in compacted["content"]:
@@ -6625,6 +6683,127 @@ class AIAgent:
                 compacted["tool_calls"] = rewritten_calls
             return compacted
 
+        def build_execution_ledger(
+            transcript: List[Dict[str, Any]],
+        ) -> Dict[str, Any] | None:
+            """Preserve concrete progress when old tool turns are projected out.
+
+            This is a deterministic action ledger, not a model-generated
+            summary. It contains only tool names, worktree-relative targets,
+            and coarse outcomes, so a compact provider turn can continue from
+            landed work without replaying source bodies or full tool output.
+            """
+
+            results_by_id: dict[str, str] = {}
+            for item in transcript:
+                if item.get("role") != "tool":
+                    continue
+                call_id = str(item.get("tool_call_id") or "")
+                if call_id:
+                    results_by_id[call_id] = str(item.get("content") or "")
+
+            mutations: list[str] = []
+            reads: list[str] = []
+            checks: list[str] = []
+            failures: list[str] = []
+
+            def add_unique(target: list[str], value: str, *, limit: int) -> None:
+                value = value.strip()
+                if value and value not in target and len(target) < limit:
+                    target.append(value)
+
+            for item in transcript:
+                if item.get("role") != "assistant":
+                    continue
+                for call in item.get("tool_calls") or []:
+                    function = (
+                        call.get("function")
+                        if isinstance(call, dict)
+                        else getattr(call, "function", None)
+                    )
+                    name = str(
+                        function.get("name")
+                        if isinstance(function, dict)
+                        else getattr(function, "name", "")
+                    ).strip()
+                    raw_args = (
+                        function.get("arguments")
+                        if isinstance(function, dict)
+                        else getattr(function, "arguments", "{}")
+                    )
+                    try:
+                        args = json.loads(raw_args or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    call_id = str(
+                        call.get("id") or call.get("call_id") or ""
+                        if isinstance(call, dict)
+                        else getattr(call, "id", "")
+                        or getattr(call, "call_id", "")
+                    )
+                    result_text = results_by_id.get(call_id, "")
+                    result_lower = result_text.casefold()
+                    failed = any(
+                        marker in result_lower
+                        for marker in (
+                            '"error"',
+                            '"success": false',
+                            "tool execution failed",
+                            "boundary rejected",
+                            "blocked:",
+                        )
+                    )
+                    path = str(
+                        args.get("path")
+                        or args.get("file_path")
+                        or args.get("filename")
+                        or ""
+                    ).strip()
+                    if name in {"write_file", "patch"} and path:
+                        label = f"{name} {path}"
+                        add_unique(
+                            failures if failed else mutations,
+                            label,
+                            limit=24,
+                        )
+                    elif name in {"read_file", "search_files"}:
+                        target = path or str(args.get("query") or "").strip()
+                        if target:
+                            add_unique(reads, f"{name} {target}", limit=16)
+                    elif name == "terminal":
+                        command = re.sub(
+                            r"\s+", " ", str(args.get("command") or "")
+                        ).strip()
+                        if command:
+                            add_unique(
+                                failures if failed else checks,
+                                f"terminal {command[:180]}",
+                                limit=8,
+                            )
+
+            if not any((mutations, reads, checks, failures)):
+                return None
+            lines = [
+                "BABEL LIVE EXECUTION LEDGER (controller-derived from this "
+                "AgentRun; current worktree state wins):"
+            ]
+            if mutations:
+                lines.append("- Successful mutations: " + "; ".join(mutations))
+            if reads:
+                lines.append("- Completed reads: " + "; ".join(reads))
+            if checks:
+                lines.append("- Completed commands: " + "; ".join(checks))
+            if failures:
+                lines.append("- Failed/rejected actions: " + "; ".join(failures))
+            lines.append(
+                "Continue the original card from this progress. Do not restart, "
+                "repeat completed reads, or rewrite successful mutations unless "
+                "a current acceptance failure requires a correction."
+            )
+            return {"role": "user", "content": "\n".join(lines)[:2_400]}
+
         # Keep the system prompt and the first user exchange stable for cache
         # reuse.  Do not pin an assistant tool-call message in the head: its
         # matching tool results belong to the active tail and must be retained
@@ -6633,6 +6812,8 @@ class AIAgent:
         # every next request, which makes a worker repeat the same tool call.
         system = [m for m in projected if m.get("role") == "system"]
         body = [m for m in projected if m.get("role") != "system"]
+        execution_ledger = build_execution_ledger(body)
+        ledger = [execution_ledger] if execution_ledger is not None else []
         head_count = min(2, len(body))
         if (
             head_count > 1
@@ -6654,9 +6835,26 @@ class AIAgent:
 
         middle = [compact_message(message) for message in body[head_count:tail_start]]
         tail = body[tail_start:]
-        projected = [*system, *head, *middle, *tail]
+        projected = [*system, *head, *ledger, *middle, *tail]
         projected = self._sanitize_api_messages(projected)
         projected_tokens = estimate_request_tokens_rough(projected, tools=self.tools)
+
+        # Preserve recent progress before preserving a verbatim 20K first-user
+        # envelope. The actionable Action Board contract is front-loaded, so
+        # a larger deterministic head excerpt retains the mutation gate,
+        # objective, criteria, and integration contract while the execution
+        # ledger retains everything already accomplished.
+        if projected_tokens > budget and head:
+            head = [
+                compact_message(message, content_limit=5_200)
+                for message in head
+            ]
+            projected = self._sanitize_api_messages(
+                [*system, *head, *ledger, *middle, *tail]
+            )
+            projected_tokens = estimate_request_tokens_rough(
+                projected, tools=self.tools
+            )
 
         # If old summaries are still too large, discard complete oldest groups.
         # The tail remains intact so the model can continue the active tool loop.
@@ -6664,7 +6862,9 @@ class AIAgent:
         while projected_tokens > budget and len(middle) > 0:
             middle.pop(0)
             dropped += 1
-            projected = self._sanitize_api_messages([*system, *head, *middle, *tail])
+            projected = self._sanitize_api_messages(
+                [*system, *head, *ledger, *middle, *tail]
+            )
             projected_tokens = estimate_request_tokens_rough(projected, tools=self.tools)
 
         # A pathological active tail can still exceed the budget (for example a
@@ -6677,7 +6877,7 @@ class AIAgent:
                     for message in tail[:-protected_tail]
                 ] + tail[-protected_tail:]
                 candidate = self._sanitize_api_messages(
-                    [*system, *head, *middle, *compact_tail]
+                    [*system, *head, *ledger, *middle, *compact_tail]
                 )
                 candidate_tokens = estimate_request_tokens_rough(
                     candidate,
@@ -6685,6 +6885,7 @@ class AIAgent:
                 )
                 projected = candidate
                 projected_tokens = candidate_tokens
+                tail = compact_tail
                 if projected_tokens <= budget:
                     break
             while projected_tokens > budget and len(tail) > 1:
@@ -6700,7 +6901,9 @@ class AIAgent:
                         remove_count += 1
                 tail = tail[remove_count:]
                 dropped += remove_count
-                projected = self._sanitize_api_messages([*system, *head, *middle, *tail])
+                projected = self._sanitize_api_messages(
+                    [*system, *head, *ledger, *middle, *tail]
+                )
                 projected_tokens = estimate_request_tokens_rough(
                     projected,
                     tools=self.tools,
@@ -6711,8 +6914,11 @@ class AIAgent:
         # (including the head) as a final fallback, without dropping the final
         # instruction.
         if projected_tokens > budget:
-            compact_head = [compact_message(message) for message in head]
-            compacted = [*system, *compact_head, *tail]
+            compact_head = [
+                compact_message(message, content_limit=3_600)
+                for message in head
+            ]
+            compacted = [*system, *compact_head, *ledger, *tail]
             projected = self._sanitize_api_messages(compacted)
             projected_tokens = estimate_request_tokens_rough(projected, tools=self.tools)
 
@@ -6734,6 +6940,7 @@ class AIAgent:
             "compacted_message_count": compacted_count,
             "dropped_message_count": dropped,
             "pruned_tool_result_count": int(pruned_count or 0),
+            "execution_ledger_applied": execution_ledger is not None,
             "within_budget": projected_tokens <= budget,
             "provenance": "provider_input_copy_only",
         }
@@ -11261,6 +11468,7 @@ class AIAgent:
                     # read/edit phase, so the next file's read is not counted
                     # as cumulative no-progress for the whole recovery run.
                     self._scoped_recovery_read_calls = 0
+                    self._scoped_recovery_read_path_counts = {}
                     self._scoped_first_action_read_calls = 0
                     self._scoped_first_action_read_paths = set()
                     self._scoped_mutation_first_block_counts = {}
@@ -11389,19 +11597,19 @@ class AIAgent:
                 read_only_recovery = bool(
                     getattr(self, "_scoped_read_only_recovery", False)
                 )
-                if read_only_recovery:
-                    raw_read_path = ""
-                    if isinstance(function_args, dict):
-                        raw_read_path = str(
-                            function_args.get("path")
-                            or function_args.get("file_path")
-                            or function_args.get("filename")
-                            or ""
-                        ).strip()
-                    normalized_read_path = _normalize_scoped_mutation_path(
-                        raw_read_path
-                    )
-                    if normalized_read_path:
+                raw_read_path = ""
+                if isinstance(function_args, dict):
+                    raw_read_path = str(
+                        function_args.get("path")
+                        or function_args.get("file_path")
+                        or function_args.get("filename")
+                        or ""
+                    ).strip()
+                normalized_read_path = _normalize_scoped_mutation_path(
+                    raw_read_path
+                )
+                if normalized_read_path:
+                    if read_only_recovery:
                         path_counts = getattr(
                             self,
                             "_scoped_verification_read_path_counts",
@@ -11427,10 +11635,42 @@ class AIAgent:
                                     function_args,
                                 ),
                             )
+                    else:
+                        path_counts = getattr(
+                            self,
+                            "_scoped_recovery_read_path_counts",
+                            {},
+                        )
+                        path_count = int(path_counts.get(normalized_read_path, 0)) + 1
+                        path_counts[normalized_read_path] = path_count
+                        self._scoped_recovery_read_path_counts = path_counts
+                        if path_count >= _scoped_mutation_recovery_repeat_path_limit():
+                            decision = ToolGuardrailDecision(
+                                action="halt",
+                                code="scoped_recovery_repeat_path",
+                                message=(
+                                    "Stopped repeated recovery read of "
+                                    f"'{normalized_read_path}' after {path_count} calls. "
+                                    "Use the first result and make the smallest concrete "
+                                    "mutation; do not request the same evidence again."
+                                ),
+                                tool_name=tool_name,
+                                count=path_count,
+                                signature=ToolCallSignature.from_call(
+                                    tool_name,
+                                    function_args,
+                                ),
+                            )
                 read_limit = (
                     _scoped_verification_read_limit()
                     if read_only_recovery
-                    else 1
+                    else _scoped_mutation_recovery_read_limit(
+                        getattr(
+                            self,
+                            "_scoped_recovery_read_limit_override",
+                            None,
+                        )
+                    )
                 )
                 if self._scoped_recovery_read_calls > read_limit:
                     decision = ToolGuardrailDecision(
@@ -11841,7 +12081,18 @@ class AIAgent:
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if not _should_parallelize_tool_batch(tool_calls):
+            # Recovery budgets are stateful and intentionally small. Running a
+            # batch of reads or edits in parallel lets every worker observe the
+            # same pre-batch counter and can oversubscribe the allowance before
+            # the post-call observer records the first result. Keep recovery
+            # batches ordered so the second call sees the first call's durable
+            # guardrail state. Normal implementation turns retain concurrent
+            # execution for independent paths.
+            bounded_recovery = bool(
+                getattr(self, "_scoped_mutation_recovery", False)
+                or getattr(self, "_scoped_read_only_recovery", False)
+            )
+            if bounded_recovery or not _should_parallelize_tool_batch(tool_calls):
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
                 )
@@ -12477,6 +12728,9 @@ class AIAgent:
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
         self._ensure_babel_scoped_tool_guardrails(messages)
+        _mutation_progress_before_batch = int(
+            getattr(self, "_scoped_mutation_progress_count", 0)
+        )
         for i, tool_call in enumerate(assistant_message.tool_calls, 1):
             # SAFETY: check interrupt BEFORE starting each tool.
             # If the user sent "stop" during a previous tool's execution,
@@ -12978,6 +13232,41 @@ class AIAgent:
                 time.sleep(self.tool_delay)
 
         # ── Per-turn aggregate budget enforcement ─────────────────────────
+        # A mutation checkpoint is a controller boundary, not a request for a
+        # second model response. Let every coherent write/patch already
+        # emitted in this assistant batch land, then return control to Babel's
+        # exact verifier. This prevents a fresh inference from forgetting the
+        # compact recovery contract and restarting repository inventory while
+        # retaining multi-file repairs that fit in one provider response.
+        _mutation_progress_after_batch = int(
+            getattr(self, "_scoped_mutation_progress_count", 0)
+        )
+        _batch_mutations = max(
+            0, _mutation_progress_after_batch - _mutation_progress_before_batch
+        )
+        if (
+            _batch_mutations > 0
+            and getattr(self, "_scoped_checkpoint_after_mutation_batch", False)
+            and self._tool_guardrail_halt_decision is None
+        ):
+            self._set_tool_guardrail_halt(
+                ToolGuardrailDecision(
+                    action="halt",
+                    code="scoped_mutation_checkpoint",
+                    message=(
+                        "Checkpointed after the current Action Board repair batch "
+                        f"made {_batch_mutations} concrete mutation(s). Persist the "
+                        "edits and return control to the controller-owned exact "
+                        "verification step without another model turn."
+                    ),
+                    tool_name="write_file",
+                    count=_batch_mutations,
+                    signature=ToolCallSignature.from_call(
+                        "write_file", {"batch_mutations": _batch_mutations}
+                    ),
+                )
+            )
+
         num_tools_seq = len(assistant_message.tool_calls)
         if num_tools_seq > 0:
             enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
@@ -13407,6 +13696,14 @@ class AIAgent:
             )
         )
         self._scoped_mutation_recovery = _continuation_mutation_recovery
+        self._scoped_checkpoint_after_mutation_batch = bool(
+            _continuation_mutation_recovery
+            and re.search(
+                r"BABEL_CONTINUATION_MUST_RESUME:\s*mutation_checkpoint",
+                _continuation_prompt,
+                flags=re.IGNORECASE,
+            )
+        )
         mutation_limit_match = re.search(
             r"BABEL_CONTINUATION_MUTATION_LIMIT:\s*(\d+)",
             _continuation_prompt,
@@ -13415,6 +13712,16 @@ class AIAgent:
         self._scoped_mutation_checkpoint_limit_override = (
             int(mutation_limit_match.group(1))
             if mutation_limit_match
+            else None
+        )
+        read_limit_match = re.search(
+            r"BABEL_CONTINUATION_READ_LIMIT:\s*(\d+)",
+            _continuation_prompt,
+            flags=re.IGNORECASE,
+        )
+        self._scoped_recovery_read_limit_override = (
+            int(read_limit_match.group(1))
+            if read_limit_match
             else None
         )
         self._scoped_read_only_recovery = bool(
@@ -13430,6 +13737,7 @@ class AIAgent:
         )
         self._scoped_mutation_path_counts = {}
         self._scoped_recovery_read_calls = 0
+        self._scoped_recovery_read_path_counts = {}
         self._scoped_verification_read_path_counts = {}
         self._scoped_verification_terminal_calls = 0
         self._scoped_exact_terminal_command = None

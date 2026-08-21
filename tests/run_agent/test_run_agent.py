@@ -1884,6 +1884,31 @@ class TestConcurrentToolExecution:
                 mock_con.assert_called_once()
                 mock_seq.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "recovery_flag",
+        ["_scoped_mutation_recovery", "_scoped_read_only_recovery"],
+    )
+    def test_bounded_recovery_forces_sequential_tool_accounting(
+        self,
+        agent,
+        recovery_flag,
+    ):
+        """Parallel calls must not oversubscribe a bounded recovery budget."""
+        setattr(agent, recovery_flag, True)
+        tc1 = _mock_tool_call(
+            name="read_file", arguments='{"path":"src/a.ts"}', call_id="c1"
+        )
+        tc2 = _mock_tool_call(
+            name="read_file", arguments='{"path":"src/b.ts"}', call_id="c2"
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
+            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
+                agent._execute_tool_calls(mock_msg, messages, "task-recovery")
+                mock_seq.assert_called_once()
+                mock_con.assert_not_called()
+
     def test_terminal_batch_forces_sequential(self, agent):
         """Stateful tools should not share the concurrent execution path."""
         tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
@@ -2617,6 +2642,59 @@ class TestRunConversation:
         assert result["turn_exit_reason"] == "guardrail_halt"
         assert result["guardrail"]["code"] == "scoped_mutation_checkpoint"
         assert "of 1 concrete mutations" in result["guardrail"]["message"]
+
+    def test_scoped_mutation_recovery_checkpoints_before_another_model_turn(self, agent):
+        """A landed repair returns to Babel before the provider can restart."""
+
+        self._setup_agent(agent)
+        agent._babel_scoped_worker = True
+        agent.valid_tool_names.update({"read_file", "write_file"})
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="write_file",
+                        arguments=(
+                            '{"path":"index.html","content":"<main id=\\"root\\"></main>"}'
+                        ),
+                        call_id="c1",
+                    )
+                ],
+            ),
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="read_file",
+                        arguments='{"path":"package.json"}',
+                        call_id="c2",
+                    )
+                ],
+            ),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_handle,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "Repair the exact failing entrypoint.\n"
+                "BABEL_CONTINUATION_ALLOWLIST: file_tools\n"
+                "BABEL_CONTINUATION_MUST_RESUME: mutation_checkpoint\n"
+                "BABEL_CONTINUATION_MUTATION_LIMIT: 2"
+            )
+
+        mock_handle.assert_called_once()
+        agent.client.chat.completions.create.assert_called_once()
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "guardrail_halt"
+        assert result["guardrail"]["code"] == "scoped_mutation_checkpoint"
+        assert "without another model turn" in result["guardrail"]["message"]
 
     def test_scoped_mutation_recovery_can_read_then_edit(self, agent):
         """A recovery segment can use one read before its bounded edit."""

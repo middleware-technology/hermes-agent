@@ -847,6 +847,106 @@ def test_action_board_mutation_recovery_respects_disabled_path():
     assert messages and "recovery mutation path is disabled" in messages[0]["content"]
 
 
+def test_action_board_mutation_recovery_allows_distinct_grounding_reads():
+    """A coherent repair may inspect several different contract files."""
+
+    agent = _make_agent("read_file")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_recovery = True
+    messages = []
+    calls = [
+        _mock_tool_call(
+            "read_file",
+            json.dumps({"path": path}),
+            f"read-{index}",
+        )
+        for index, path in enumerate(
+            ("package.json", "tsconfig.json", "vite.config.ts"),
+            start=1,
+        )
+    ]
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"content": "grounding evidence"}),
+    ) as mock_hfc:
+        for call in calls:
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[call]),
+                messages,
+                "task-recovery-reads",
+            )
+
+    assert mock_hfc.call_count == 3
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def test_action_board_mutation_recovery_honors_card_local_read_limit():
+    """The remediation contract can stop broad grounding before another model loop."""
+
+    agent = _make_agent("read_file")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_recovery = True
+    agent._scoped_recovery_read_limit_override = 1
+
+    agent._append_guardrail_observation(
+        "read_file",
+        {"path": "server/index.ts"},
+        json.dumps({"content": "server"}),
+        failed=False,
+    )
+    assert agent._tool_guardrail_halt_decision is None
+
+    agent._append_guardrail_observation(
+        "read_file",
+        {"path": "tsconfig.json"},
+        json.dumps({"content": "config"}),
+        failed=False,
+    )
+
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "scoped_recovery_read_limit"
+    assert "limit 1" in agent._tool_guardrail_halt_decision.message
+
+
+def test_action_board_mutation_recovery_halts_repeated_grounding_path():
+    """One dedup redirect may recover; a third identical read halts the loop."""
+
+    agent = _make_agent("read_file")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_recovery = True
+    messages = []
+    calls = [
+        _mock_tool_call(
+            "read_file",
+            json.dumps({"path": "package.json"}),
+            f"repeat-{index}",
+        )
+        for index in range(1, 4)
+    ]
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"content": "same evidence"}),
+    ):
+        for index, call in enumerate(calls, start=1):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[call]),
+                messages,
+                "task-recovery-repeat",
+            )
+            if index == 2:
+                assert agent._tool_guardrail_halt_decision is None
+
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "scoped_recovery_repeat_path"
+    assert "package.json" in agent._tool_guardrail_halt_decision.message
+    assert "after 3 calls" in agent._tool_guardrail_halt_decision.message
+
+
 def test_action_board_mutation_recovery_respects_disabled_dotfile_path():
     """Dotfiles keep their leading dot across recovery path normalization."""
 

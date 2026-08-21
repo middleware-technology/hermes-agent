@@ -129,3 +129,69 @@ def test_projection_drops_tool_call_groups_atomically_without_unavailable_stubs(
     # should survive when the budget cannot retain the entire transcript.
     assert "call-1" in assistant_calls
     assert "call-1" in result_ids
+
+
+def test_projection_preserves_action_ledger_when_tool_history_is_dropped() -> None:
+    """A bounded worker remembers landed files instead of restarting its card."""
+
+    agent = _agent(8_192)
+    agent.tools = [{
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "bounded file mutation " + "s" * 9_000,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    original_instruction = (
+        "ACTION BOARD FIRST-ACTION CONTRACT: continue concrete work.\n"
+        + "policy " * 320
+        + "\nCard: Establish project foundation\n"
+        "Objective: Create package.json, tsconfig.json, and the server entrypoint.\n"
+        "Acceptance Criteria: npm test, typecheck, and build pass.\n"
+        + "durable audit context " * 650
+    )
+    messages = [
+        {"role": "system", "content": "stable boundary " + "b" * 4_000},
+        {"role": "user", "content": original_instruction},
+    ]
+    for index, path in enumerate(
+        ("package.json", "tsconfig.json", "src/server/index.ts")
+    ):
+        call_id = f"write-{index}"
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": f"Creating {path}",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": (
+                            '{"path":"' + path + '","content":"'
+                            + "x" * 2_400
+                            + '"}'
+                        ),
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": '{"bytes_written":2400,"success":true}',
+            },
+        ])
+
+    projected = agent._project_live_context_for_request(messages)
+    rendered = "\n".join(str(item.get("content") or "") for item in projected)
+
+    assert estimate_request_tokens_rough(projected, tools=agent.tools) <= 8_192
+    assert "Card: Establish project foundation" in rendered
+    assert "BABEL LIVE EXECUTION LEDGER" in rendered
+    assert "write_file package.json" in rendered
+    assert "write_file tsconfig.json" in rendered
+    assert "write_file src/server/index.ts" in rendered
+    assert "Do not restart" in rendered
+    assert agent._last_live_context_projection["execution_ledger_applied"] is True
+    assert agent._last_live_context_projection["projected_message_count"] > 2

@@ -179,6 +179,21 @@ def _benchmark_probe_recovery_result(
 def _benchmark_probe_noop_result(*, reason: str) -> str:
     """Return a safe no-op for an outside-worktree Action Board probe."""
 
+    if "old_string and new_string are identical" in str(reason).casefold():
+        return json.dumps(
+            {
+                "success": True,
+                "ignored": True,
+                "noop": True,
+                "message": (
+                    "The requested replacement already matches the current "
+                    "state. Continue from this satisfied postcondition without "
+                    "retrying the same patch."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
     return json.dumps(
         {
             "success": False,
