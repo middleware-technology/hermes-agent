@@ -1840,7 +1840,14 @@ _AUTO_PROVIDER_LABELS = {
     "_resolve_api_key_provider": "api-key",
 }
 
-_MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode")
+_MAIN_RUNTIME_FIELDS = (
+    "provider",
+    "model",
+    "base_url",
+    "api_key",
+    "api_mode",
+    "babel_action_board_scoped",
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, str]:
@@ -2444,6 +2451,15 @@ def _try_payment_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    if (
+        os.getenv("BABEL_ENV", "").strip().lower() == "test"
+        and os.getenv("BABEL_BENCH_DEEPSEEK_ONLY", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        # A benchmark run must never turn a provider failure into an
+        # un-attributable OpenRouter/Nous call. Normal product fallback stays
+        # unchanged outside this explicit local gate.
+        return None, None, ""
     # Normalise the failed provider label for matching.
     skip = failed_provider.lower().strip()
     # Also skip Step-1 main-provider path if it maps to the same backend.
@@ -2498,7 +2514,33 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
     """
     global auxiliary_is_nous, _stale_base_url_warned
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
+    # A developer-local benchmark that attributes every token to DeepSeek must
+    # not probe subscription/aggregator fallbacks when an auxiliary caller did
+    # not forward the scoped runtime envelope.  This is intentionally an
+    # opt-in test-process gate; normal product runs retain the full fallback
+    # chain and the scoped-worker runtime flag below remains the primary
+    # product protection.
+    if (
+        os.getenv("BABEL_ENV", "").strip().lower() == "test"
+        and os.getenv("BABEL_BENCH_DEEPSEEK_ONLY", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        logger.debug("Auxiliary auto-detect disabled by DeepSeek-only benchmark gate")
+        return None, None
     runtime = _normalize_main_runtime(main_runtime)
+    scoped_worker = str(runtime.get("babel_action_board_scoped") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if scoped_worker:
+        # Babel's Action Board supplies the authoritative bounded context
+        # envelope.  Do not probe unrelated auxiliary providers or create a
+        # second transcript for a scoped worker; those calls are neither
+        # needed for execution nor attributable to the card's model budget.
+        logger.debug("Auxiliary auto-detect disabled for Babel Action Board worker")
+        return None, None
     runtime_provider = runtime.get("provider", "")
     runtime_model = runtime.get("model", "")
     runtime_base_url = runtime.get("base_url", "")
@@ -2710,6 +2752,23 @@ def resolve_provider_client(
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
+    # Keep the developer-local DeepSeek benchmark attributable even when an
+    # auxiliary caller supplies an explicit provider (vision/strict helpers
+    # and task overrides do not always pass through ``_resolve_auto``).  Normal
+    # product runs retain the complete fallback chain because this gate is
+    # enabled only by the benchmark environment.
+    if (
+        os.getenv("BABEL_ENV", "").strip().lower() == "test"
+        and os.getenv("BABEL_BENCH_DEEPSEEK_ONLY", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        requested_aux_provider = _normalize_aux_provider(provider)
+        if requested_aux_provider not in {"deepseek", "deepseek-api"}:
+            logger.debug(
+                "Auxiliary provider %s disabled by DeepSeek-only benchmark gate",
+                requested_aux_provider,
+            )
+            return None, None
     _validate_proxy_env_urls()
     # Preserve the original provider name before alias normalization so a
     # user-declared ``custom_providers`` entry whose name coincidentally
@@ -3271,6 +3330,12 @@ def _resolve_strict_vision_backend(
     provider: str,
     model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
+    if (
+        os.getenv("BABEL_ENV", "").strip().lower() == "test"
+        and os.getenv("BABEL_BENCH_DEEPSEEK_ONLY", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        return None, None
     provider = _normalize_vision_provider(provider)
     if provider == "copilot":
         return resolve_provider_client("copilot", model, is_vision=True)
@@ -3334,6 +3399,15 @@ def resolve_vision_provider_client(
     backends, so users can intentionally force experimental providers. Auto mode
     stays conservative and only tries vision backends known to work today.
     """
+    if (
+        os.getenv("BABEL_ENV", "").strip().lower() == "test"
+        and os.getenv("BABEL_BENCH_DEEPSEEK_ONLY", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        # Vision helpers have direct OpenRouter/Nous probes that do not pass
+        # through the text auxiliary router. Keep those probes out of the
+        # benchmark provider-attribution envelope.
+        return None, None, None
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision", provider, model, base_url, api_key
     )

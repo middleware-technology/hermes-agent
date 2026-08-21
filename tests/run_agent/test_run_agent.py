@@ -2494,6 +2494,313 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_segment_usage_budget_checkpoints_after_landed_tool_batch(self, agent):
+        """A durable worker stops before starting another costly provider call."""
+
+        self._setup_agent(agent)
+        agent.segment_total_token_budget = 8_000
+        tool_call = _mock_tool_call(
+            name="web_search",
+            arguments='{"query":"bounded evidence"}',
+            call_id="c1",
+        )
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tool_call],
+            usage={
+                "prompt_tokens": 8_000,
+                "completion_tokens": 500,
+                "total_tokens": 8_500,
+            },
+        )
+
+        with (
+            patch("run_agent.handle_function_call", return_value="evidence landed") as mock_handle,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Collect the evidence and continue.")
+
+        mock_handle.assert_called_once()
+        agent.client.chat.completions.create.assert_called_once()
+        assert result["completed"] is False
+        assert result["turn_exit_reason"] == "segment_token_budget_reached(8500/8000)"
+        assert result["total_tokens"] == 8_500
+
+    def test_scoped_mutation_recovery_checkpoints_after_bounded_edit_window(self, agent):
+        """Recovery can finish a coherent edit batch before checkpointing."""
+
+        self._setup_agent(agent)
+        agent._babel_scoped_worker = True
+        agent._scoped_mutation_recovery = True
+        agent.valid_tool_names.add("write_file")
+        tool_turns = [
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="write_file",
+                        arguments=json.dumps(
+                            {
+                                "path": f"src/file-{index}.ts",
+                                "content": "export {};",
+                            }
+                        ),
+                        call_id=f"c{index}",
+                    )
+                ],
+            )
+            for index in range(1, 7)
+        ]
+        agent.client.chat.completions.create.side_effect = tool_turns
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_handle,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "Implement the source objective\nBABEL_CONTINUATION_ALLOWLIST: file_tools"
+            )
+
+        assert mock_handle.call_count == 6
+        # The successful edit window is a completed *segment*. Babel's
+        # adapter converts the checkpoint into a durable continuation before
+        # card finalization.
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "guardrail_halt"
+        assert result["guardrail"]["code"] == "scoped_mutation_checkpoint"
+        assert "of 6 concrete mutations" in result["guardrail"]["message"]
+        assert "BABEL_CONTINUATION_DISABLE_PATH: src/file-6.ts" in result["guardrail"]["message"]
+
+    def test_scoped_mutation_recovery_honors_single_edit_contract(self, agent):
+        """A server-targeted recovery checkpoints immediately after its edit."""
+
+        self._setup_agent(agent)
+        agent._babel_scoped_worker = True
+        agent.valid_tool_names.add("write_file")
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="write_file",
+                    arguments=json.dumps(
+                        {
+                            "path": "package.json",
+                            "content": '{"scripts":{"test":"node --test"}}',
+                        }
+                    ),
+                    call_id="c1",
+                )
+            ],
+        )
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_handle,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "Implement the manifest\n"
+                "BABEL_CONTINUATION_ALLOWLIST: file_tools\n"
+                "BABEL_CONTINUATION_MUTATION_LIMIT: 1"
+            )
+
+        mock_handle.assert_called_once()
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "guardrail_halt"
+        assert result["guardrail"]["code"] == "scoped_mutation_checkpoint"
+        assert "of 1 concrete mutations" in result["guardrail"]["message"]
+
+    def test_scoped_mutation_recovery_can_read_then_edit(self, agent):
+        """A recovery segment can use one read before its bounded edit."""
+
+        self._setup_agent(agent)
+        agent._babel_scoped_worker = True
+        agent._scoped_mutation_recovery = True
+        agent.valid_tool_names.update({"read_file", "write_file"})
+        read_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="read_file",
+                    arguments='{"path":"package.json"}',
+                    call_id="c1",
+                )
+            ],
+        )
+        write_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="write_file",
+                    arguments='{"path":"src/main.tsx","content":"export const app = true;"}',
+                    call_id="c2",
+                )
+            ],
+        )
+        second_read_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="read_file",
+                    arguments='{"path":"tsconfig.json"}',
+                    call_id="c3",
+                )
+            ],
+        )
+        second_write_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="write_file",
+                    arguments='{"path":"tsconfig.json","content":"{}"}',
+                    call_id="c4",
+                )
+            ],
+        )
+        final_turn = _mock_response(
+            content="Foundation repair complete.",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            read_turn,
+            write_turn,
+            second_read_turn,
+            second_write_turn,
+            final_turn,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_handle,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "Recover the implementation target\nBABEL_CONTINUATION_ALLOWLIST: file_tools"
+            )
+
+        assert mock_handle.call_count == 4
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+        assert result.get("guardrail") is None
+
+    def test_scoped_initial_worker_can_read_edit_and_validate_in_one_run(self, agent):
+        """Cold Action Board work is not misclassified as mutation recovery."""
+
+        self._setup_agent(agent)
+        agent._babel_scoped_worker = True
+        agent._scoped_truncated_tool_recovery = True
+        agent.valid_tool_names.update({"read_file", "write_file", "terminal"})
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="read_file",
+                        arguments='{"path":"calculator.py"}',
+                        call_id="c1",
+                    )
+                ],
+            ),
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="read_file",
+                        arguments='{"path":"test_calculator.py"}',
+                        call_id="c2",
+                    )
+                ],
+            ),
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="write_file",
+                        arguments='{"path":"calculator.py","content":"def add(a, b):\\n    return a + b\\n"}',
+                        call_id="c3",
+                    )
+                ],
+            ),
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="terminal",
+                        arguments='{"command":"python3 -m unittest -q"}',
+                        call_id="c4",
+                    )
+                ],
+            ),
+            _mock_response(content="The fix is implemented and tests pass.", finish_reason="stop"),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_handle,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Fix calculator.add and run its tests")
+
+        assert mock_handle.call_count == 4
+        assert result["completed"] is True
+        assert result["final_response"] == "The fix is implemented and tests pass."
+        assert result.get("guardrail") is None
+        assert agent._scoped_mutation_recovery is False
+
+    def test_scoped_verification_can_finish_after_one_targeted_read(self, agent):
+        """Read-only verification can summarize evidence after one read."""
+
+        self._setup_agent(agent)
+        agent._babel_scoped_worker = True
+        agent._scoped_read_only_recovery = True
+        agent.valid_tool_names.add("read_file")
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    name="read_file",
+                    arguments='{"path":"package.json"}',
+                    call_id="c1",
+                )
+            ],
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn,
+            _mock_response(content="The manifest evidence is sufficient.", finish_reason="stop"),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_handle,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Verify the implementation")
+
+        mock_handle.assert_called_once()
+        assert result["completed"] is True
+        assert result["final_response"] == "The manifest evidence is sufficient."
+        assert result.get("guardrail") is None
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -3261,7 +3568,17 @@ class TestRunConversation:
             arguments='{"path":"report.md","content":"partial',
             call_id="c1",
         )
-        resp = _mock_response(content="", finish_reason="length", tool_calls=[bad_tc])
+        resp = _mock_response(
+            content="",
+            finish_reason="length",
+            tool_calls=[bad_tc],
+            usage={
+                "prompt_tokens": 8_000,
+                "completion_tokens": 4_096,
+                "total_tokens": 12_096,
+                "prompt_tokens_details": SimpleNamespace(cached_tokens=6_000),
+            },
+        )
         agent.client.chat.completions.create.return_value = resp
 
         with (
@@ -3275,6 +3592,19 @@ class TestRunConversation:
         assert result["completed"] is False
         assert result["partial"] is True
         assert "truncated due to output length limit" in result["error"]
+        # Usage must be counted before the truncation branch returns. The
+        # Babel adapter projects these cumulative counters into the durable
+        # AgentRun even though this early result does not use the normal
+        # result builder.
+        # Hermes makes one bounded retry before returning the checkpoint; each
+        # provider response is counted exactly once.
+        assert agent.session_api_calls == 2
+        # ``input_tokens`` is provider-normalized uncached input; cached input
+        # is attributed separately rather than counted twice.
+        assert agent.session_input_tokens == 4_000
+        assert agent.session_cache_read_tokens == 12_000
+        assert agent.session_output_tokens == 8_192
+        assert agent.session_total_tokens == 24_192
         mock_handle_function_call.assert_not_called()
 
     def test_truncated_tool_call_retries_once_before_refusing(self, agent):
@@ -3315,6 +3645,56 @@ class TestRunConversation:
         # Tool was executed on the retry (good_resp)
         mock_hfc.assert_called_once()
         assert result["final_response"] == "Done!"
+
+    @pytest.mark.parametrize("finish_reason", ["length", "tool_calls"])
+    def test_scoped_truncated_tool_call_checkpoints_instead_of_failing(self, agent, finish_reason):
+        """Action Board recovery converts repeated truncation into a checkpoint.
+
+        A large file payload must not be executed with incomplete JSON and must
+        not terminate the unattended card.  Babel can dispatch a fresh segment
+        with the guardrail marker and the next concrete target.
+        """
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        agent._babel_scoped_worker = True
+        agent._scoped_mutation_recovery = True
+        bad_responses = [
+            _mock_response(
+                content="",
+                finish_reason=finish_reason,
+                tool_calls=[
+                    _mock_tool_call(
+                        name="write_file",
+                        arguments='{"path":"server/domain.ts","content":"partial',
+                        call_id=f"c{i}",
+                    )
+                ],
+            )
+            for i in range(1, 5)
+        ]
+        agent.client.chat.completions.create.side_effect = bad_responses
+
+        with (
+            patch("run_agent.handle_function_call") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "implement the domain layer\nBABEL_CONTINUATION_ALLOWLIST: file_tools"
+            )
+
+        mock_handle_function_call.assert_not_called()
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["turn_exit_reason"] == "guardrail_halt"
+        assert result["guardrail"]["code"] == "scoped_truncated_tool_call"
+        assert "BABEL_CONTINUATION_DISABLE_PATH: server/domain.ts" in result["guardrail"]["message"]
+        calls = agent.client.chat.completions.create.call_args_list
+        # A scoped worker gets one bounded retry, then Babel owns the durable
+        # continuation. Replaying the same malformed large payload further
+        # only burns provider calls.
+        assert len(calls) == 2
 
     def test_truncated_tool_args_detected_when_finish_reason_not_length(self, agent):
         """When a router rewrites finish_reason from 'length' to 'tool_calls',

@@ -258,6 +258,26 @@ class TestSkillViewQualifiedName:
         assert result["name"] == "ticktick"
         assert "TickTick body." in result["content"]
 
+    def test_registered_plugin_namespace_does_not_hide_local_skill(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+
+        # The plugin namespace is registered, but the requested skill is a
+        # local categorized Babel skill.  The resolver must continue to the
+        # filesystem instead of producing a repair-triggering plugin miss.
+        self._register_skill(tmp_path, plugin="babel", name="other-skill")
+        local_skills = tmp_path / "local-skills"
+        skill_dir = local_skills / "babel" / "action-board"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: action-board\ndescription: local Babel skill\n---\nBabel body.\n"
+        )
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", local_skills)
+
+        result = json.loads(skill_view("babel:action-board"))
+
+        assert result["success"] is True
+        assert "Babel body." in result["content"]
+
     def test_stale_entry_self_heals(self, tmp_path):
         from tools.skills_tool import skill_view
 

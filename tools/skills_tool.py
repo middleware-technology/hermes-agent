@@ -942,6 +942,7 @@ def skill_view(
                 ensure_ascii=False,
             )
         local_category_name: str | None = None
+        qualified_plugin_missing: dict[str, Any] | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
         # Bare names fall through to the existing flat-tree scan below.
@@ -993,15 +994,18 @@ def skill_view(
             # Plugin exists but this specific skill is missing?
             available = pm.list_plugin_skills(namespace)
             if available:
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": f"Skill '{bare}' not found in plugin '{namespace}'.",
-                        "available_skills": [f"{namespace}:{s}" for s in available],
-                        "hint": f"The '{namespace}' plugin provides {len(available)} skill(s).",
-                    },
-                    ensure_ascii=False,
-                )
+                # A local Babel skill can legitimately use the same qualified
+                # spelling even when a plugin namespace is registered.  Keep
+                # the plugin diagnostic as a fallback, but continue into the
+                # local categorized-skill scan instead of failing before the
+                # filesystem is consulted.  This avoids transient registry
+                # races producing repeated ``skill_view`` repair turns.
+                qualified_plugin_missing = {
+                    "success": False,
+                    "error": f"Skill '{bare}' not found in plugin '{namespace}'.",
+                    "available_skills": [f"{namespace}:{s}" for s in available],
+                    "hint": f"The '{namespace}' plugin provides {len(available)} skill(s).",
+                }
             # Plugin itself not found — fall through to flat-tree scan.
             # Categorized local skills also use `category:skill` in config and
             # gateway prompts, so preserve that form and translate it to the
@@ -1069,16 +1073,38 @@ def skill_view(
                 elif categorized_path.with_suffix(".md").exists():
                     _record(None, categorized_path.with_suffix(".md"))
 
+                # Some older local installs flattened categorized skills or
+                # materialized them beneath a namespace-specific parent.  The
+                # qualified alias should still resolve those exact local
+                # entries, but never guess from an unrelated bare skill.
+                bare_path = search_dir / bare
+                if bare_path.is_dir() and (bare_path / "SKILL.md").exists():
+                    _record(bare_path, bare_path / "SKILL.md")
+                elif bare_path.with_suffix(".md").exists():
+                    _record(None, bare_path.with_suffix(".md"))
+
             # Strategy 2: recursive by directory name (catches nested skills
             # like "foundations/runtime/explore-codebase" called by bare name).
             for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                if found_skill_md.parent.name == name:
+                parent_matches = found_skill_md.parent.name in {
+                    name,
+                    bare if local_category_name else name,
+                }
+                namespace_matches = (
+                    local_category_name is not None
+                    and str(namespace).strip() in found_skill_md.parts
+                )
+                if parent_matches or namespace_matches and found_skill_md.parent.name == bare:
                     _record(found_skill_md.parent, found_skill_md)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
             for found_md in search_dir.rglob(f"{name}.md"):
                 if found_md.name != "SKILL.md":
                     _record(None, found_md)
+            if local_category_name:
+                for found_md in search_dir.rglob(f"{bare}.md"):
+                    if found_md.name != "SKILL.md":
+                        _record(None, found_md)
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
@@ -1108,6 +1134,8 @@ def skill_view(
             skill_dir, skill_md = candidates[0]
 
         if not skill_md or not skill_md.exists():
+            if qualified_plugin_missing is not None:
+                return json.dumps(qualified_plugin_missing, ensure_ascii=False)
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
             return json.dumps(
                 {

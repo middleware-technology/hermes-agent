@@ -2176,6 +2176,18 @@ def terminal_tool(
             from agent.redact import redact_sensitive_text
             output = redact_sensitive_text(output.strip()) if output else ""
 
+            # Action Board workers must reason in worktree-relative paths. The
+            # terminal still executes against the canonical absolute cwd, but
+            # leaking that host path back into the model causes it to copy an
+            # absolute path into the next call, which Babel correctly rejects.
+            scoped_output_root = overrides.get("babel_scoped_output_root")
+            if scoped_output_root and output:
+                try:
+                    display_root = str(Path(scoped_output_root).expanduser().resolve())
+                except (OSError, RuntimeError, ValueError):
+                    display_root = str(scoped_output_root).rstrip("/")
+                output = output.replace(display_root, ".")
+
             # Interpret non-zero exit codes that aren't real errors
             # (e.g. grep=1 means "no matches", diff=1 means "files differ")
             exit_note = _interpret_exit_code(command, returncode)

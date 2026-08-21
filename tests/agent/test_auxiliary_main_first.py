@@ -162,6 +162,57 @@ class TestResolveAutoMainFirst:
         assert mock_resolve.call_args.args[0] == "anthropic"
         assert mock_resolve.call_args.args[1] == "runtime-model"
 
+    def test_action_board_worker_does_not_probe_auxiliary_providers(self):
+        """Babel owns the scoped worker context; no side-provider fallback."""
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client"
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._try_openrouter"
+        ) as mock_openrouter:
+            from agent.auxiliary_client import _resolve_auto
+
+            client, model = _resolve_auto(
+                main_runtime={
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-pro",
+                    "babel_action_board_scoped": "1",
+                }
+            )
+
+        assert client is None
+        assert model is None
+        mock_resolve.assert_not_called()
+        mock_openrouter.assert_not_called()
+
+    def test_deepseek_only_benchmark_gate_blocks_unscoped_fallbacks(self, monkeypatch):
+        """Early auxiliary callers cannot escape the benchmark provider lane."""
+        monkeypatch.setenv("BABEL_ENV", "test")
+        monkeypatch.setenv("BABEL_BENCH_DEEPSEEK_ONLY", "1")
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client"
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._try_openrouter"
+        ) as mock_openrouter:
+            from agent.auxiliary_client import _resolve_auto
+
+            client, model = _resolve_auto()
+
+        assert client is None
+        assert model is None
+        mock_resolve.assert_not_called()
+        mock_openrouter.assert_not_called()
+
+    def test_deepseek_only_gate_blocks_explicit_aux_provider(self, monkeypatch):
+        """Explicit task/vision overrides cannot reintroduce OpenRouter/Nous."""
+        monkeypatch.setenv("BABEL_ENV", "test")
+        monkeypatch.setenv("BABEL_BENCH_DEEPSEEK_ONLY", "1")
+        from agent.auxiliary_client import resolve_provider_client
+
+        client, model = resolve_provider_client("openrouter", model="x/y")
+
+        assert client is None
+        assert model is None
+
 
 # ── Vision — resolve_vision_provider_client ─────────────────────────────────
 

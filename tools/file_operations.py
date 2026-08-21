@@ -576,9 +576,16 @@ class ShellFileOperations(FileOperations):
         if stdin_data is not None:
             kwargs['stdin_data'] = stdin_data
 
-        # Resolve cwd from the live env so `cd` commands are picked up.
-        # Fall through to init-time self.cwd only if the env doesn't track cwd.
-        effective_cwd = cwd or getattr(self.env, 'cwd', None) or self.cwd
+        # Resolve cwd from the live env so `cd` commands are picked up for
+        # interactive calls.  Scoped Action Board file operations are
+        # deliberately bound to their validated worktree instead: the shared
+        # terminal environment may still point at a previous card or a
+        # removed checkout, and allowing it to override ``self.cwd`` makes a
+        # harmless relative read such as ``.`` fail or escape the card.
+        if self.inprocess_validation_only:
+            effective_cwd = cwd or self.cwd
+        else:
+            effective_cwd = cwd or getattr(self.env, 'cwd', None) or self.cwd
         result = self.env.execute(command, cwd=effective_cwd, **kwargs)
         return ExecuteResult(
             stdout=result.get("output", ""),

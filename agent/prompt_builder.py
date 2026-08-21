@@ -733,7 +733,7 @@ def _clear_backend_probe_cache() -> None:
     _BACKEND_PROBE_CACHE.clear()
 
 
-def build_environment_hints() -> str:
+def build_environment_hints(cwd: str | None = None) -> str:
     """Return environment-specific guidance for the system prompt.
 
     Always emits a factual block describing the execution environment:
@@ -772,7 +772,12 @@ def build_environment_hints() -> str:
 
         host_lines.append(f"User home directory: {os.path.expanduser('~')}")
         try:
-            host_lines.append(f"Current working directory: {os.getcwd()}")
+            # Babel's scoped Action Board workers can share one host process
+            # without changing its process-global cwd.  Accept an explicit
+            # tool/runtime cwd so the model sees the directory its tools
+            # actually operate in, rather than the API server's cwd.
+            effective_cwd = str(cwd).strip() if isinstance(cwd, str) and cwd.strip() else os.getcwd()
+            host_lines.append(f"Current working directory: {effective_cwd}")
         except OSError:
             pass
 

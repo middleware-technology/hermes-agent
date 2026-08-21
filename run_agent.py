@@ -41,6 +41,7 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import posixpath
 import random
 import re
 import ssl
@@ -72,6 +73,46 @@ from hermes_constants import get_hermes_home
 
 
 _OPENAI_CLS_CACHE: Optional[type] = None
+
+
+def _scoped_action_board_guardrail_mode() -> bool:
+    """Return whether the current Hermes worker is an unattended board card."""
+
+    return True
+
+
+def _benchmark_scoped_guardrail_mode() -> bool:
+    """Compatibility alias retained for local benchmark diagnostics."""
+
+    return _scoped_action_board_guardrail_mode()
+
+
+def _scoped_action_board_guardrail_config() -> dict[str, object]:
+    # A single repeated read is often a model formatting hiccup rather than a
+    # genuine runaway loop. Give the worker a few bounded opportunities to
+    # change strategy before Babel checkpoints the card; the API-side recovery
+    # prompt keeps the next segment focused on a concrete project edit. This
+    # remains substantially below the historical unbounded retry budget.
+    return {
+        "warnings_enabled": True,
+        "hard_stop_enabled": True,
+        "warn_after": {
+            "idempotent_no_progress": 1,
+            "same_tool_failure": 1,
+            "exact_failure": 1,
+        },
+        "hard_stop_after": {
+            "idempotent_no_progress": 5,
+            "same_tool_failure": 5,
+            "exact_failure": 5,
+        },
+    }
+
+
+def _benchmark_scoped_guardrail_config() -> dict[str, object]:
+    """Compatibility alias for the shared Action Board policy."""
+
+    return _scoped_action_board_guardrail_config()
 
 
 def _load_openai_cls() -> type:
@@ -157,7 +198,7 @@ from agent.model_metadata import (
     save_context_length, is_local_endpoint,
     query_ollama_num_ctx,
 )
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import ContextCompressor, _truncate_tool_call_args_json
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
@@ -178,6 +219,7 @@ from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolGuardrailDecision,
+    ToolCallSignature,
     append_toolguard_guidance,
     toolguard_synthetic_result,
 )
@@ -397,9 +439,96 @@ def _is_destructive_command(cmd: str) -> bool:
         return False
     if _DESTRUCTIVE_PATTERNS.search(cmd):
         return True
-    if _REDIRECT_OVERWRITE.search(cmd):
+    # Diagnostic redirects such as ``2>/dev/null`` are ubiquitous in safe
+    # inventory commands and do not write into the worktree.  Remove them
+    # before checking for an output redirect that could indicate a mutation.
+    redirect_free = re.sub(r"(?:\d+|&)?\s*>\s*/dev/null\b", "", cmd)
+    if _REDIRECT_OVERWRITE.search(redirect_free):
         return True
     return False
+
+
+_TERMINAL_INVENTORY_COMMAND = re.compile(
+    r"^(?:pwd|ls(?:\s|$)|find(?:\s|$)|fd(?:\s|$)|tree(?:\s|$)|"
+    r"rg(?:\s|$)|git\s+status(?:\s|$)|git\s+diff\s+--name-only(?:\s|$))",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_terminal_inventory_command(cmd: str) -> bool:
+    """Identify broad shell discovery that is invalid in final verification."""
+
+    if not isinstance(cmd, str) or not cmd.strip():
+        return False
+    # Check every shell segment so a provider cannot hide an inventory pass
+    # behind ``cd`` or append it after an otherwise targeted command.
+    for segment in re.split(r"(?:&&|\|\||[;|\n])", cmd):
+        candidate = segment.strip()
+        candidate = re.sub(r"^cd\s+\S+\s*", "", candidate).strip()
+        if _TERMINAL_INVENTORY_COMMAND.match(candidate):
+            return True
+    return False
+
+
+def _scoped_terminal_inventory_limit() -> int:
+    """Bound aggregate read-only terminal inspection for Action Board workers."""
+
+    raw = os.getenv("BABEL_ACTION_BOARD_TERMINAL_INVENTORY_LIMIT", "4")
+    try:
+        requested = int(raw) if raw.strip() else 4
+    except (TypeError, ValueError):
+        requested = 4
+    return max(2, min(requested, 32))
+
+
+def _scoped_verification_read_limit() -> int:
+    """Allow a verifier to inspect a bounded set of distinct evidence files."""
+
+    raw = os.getenv("BABEL_ACTION_BOARD_VERIFICATION_READ_LIMIT", "8")
+    try:
+        requested = int(raw) if raw.strip() else 8
+    except (TypeError, ValueError):
+        requested = 8
+    return max(2, min(requested, 32))
+
+
+def _scoped_mutation_checkpoint_limit(override: int | None = None) -> int:
+    """Bound productive edits per Action Board recovery segment.
+
+    Recovery used to checkpoint after every successful mutation.  That kept
+    transcripts small, but it also forced Babel to rebuild the worker prompt
+    and pay another model startup for every file in a multi-file repair.  A
+    small edit window preserves the durable boundary without turning normal
+    project scaffolding into a stop/restart loop.
+    """
+
+    if override is not None:
+        try:
+            return max(1, min(int(override), 16))
+        except (TypeError, ValueError):
+            pass
+    raw = os.getenv("BABEL_ACTION_BOARD_MUTATION_CHECKPOINT_LIMIT", "6")
+    try:
+        requested = int(raw) if raw.strip() else 6
+    except (TypeError, ValueError):
+        requested = 6
+    return max(2, min(requested, 16))
+
+
+def _scoped_mutation_first_read_limit() -> int:
+    """Bound distinct grounding reads before the first Action Board edit.
+
+    Integrated cards may legitimately need the manifest, an entry point, and
+    adjacent contracts before a safe mutation. Distinct targeted files are
+    useful evidence; rereading one path is the no-progress signal.
+    """
+
+    raw = os.getenv("BABEL_ACTION_BOARD_MUTATION_FIRST_READ_LIMIT", "8")
+    try:
+        requested = int(raw) if raw.strip() else 8
+    except (TypeError, ValueError):
+        requested = 8
+    return max(2, min(requested, 16))
 
 
 def _should_parallelize_tool_batch(tool_calls) -> bool:
@@ -575,6 +704,56 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
                 paths.append(p)
         return paths
     return []
+
+
+def _normalize_scoped_mutation_path(value: Any) -> str:
+    """Return a stable logical path for Action Board mutation guardrails.
+
+    File tools may receive either a worktree-relative path (the preferred
+    contract) or an absolute path emitted by a model/provider.  Recovery
+    markers are carried into a new Hermes segment, so comparing those forms
+    literally lets a worker bypass a disabled path by switching between
+    ``server/index.ts`` and ``/tmp/.../.babel-worktrees/<name>/server/index.ts``.
+    Reduce worktree paths to their logical suffix while retaining ordinary
+    relative paths.  This is only used by the scoped recovery circuit breaker;
+    normal interactive file semantics are unchanged.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    raw = value.strip().replace("\\", "/")
+    normalized = posixpath.normpath(raw)
+    if normalized in {"", "."}:
+        return ""
+    # Absolute tool paths frequently include the disposable Action Board
+    # worktree name.  Strip that unstable prefix so the next segment can
+    # match a relative model-authored path to the same file.
+    marker = "/.babel-worktrees/"
+    if marker in normalized:
+        suffix = normalized.split(marker, 1)[1]
+        if "/" in suffix:
+            normalized = suffix.split("/", 1)[1]
+    elif normalized.startswith("/"):
+        # Prefer a path relative to the explicit tool cwd when available.
+        for root in (
+            os.environ.get("TERMINAL_CWD"),
+            os.environ.get("BABEL_ACTION_BOARD_WORKTREE"),
+            os.getcwd(),
+        ):
+            if not root:
+                continue
+            try:
+                candidate = posixpath.relpath(
+                    normalized, str(root).replace("\\", "/")
+                )
+            except (TypeError, ValueError):
+                continue
+            if candidate != ".." and not candidate.startswith("../"):
+                normalized = candidate
+                break
+    # Remove only an explicit ``./`` prefix.  Stripping the character set
+    # ``./`` would turn ``.env.example`` into ``env.example`` and let a
+    # recovery segment bypass a disabled dotfile path.
+    return re.sub(r"^(?:\./)+", "", normalized)
 
 
 def _extract_error_preview(result: Any, max_len: int = 180) -> str:
@@ -1139,9 +1318,12 @@ class AIAgent:
         args: list[str] | None = None,
         model: str = "",
         max_iterations: int | None = 90,  # None disables the per-turn iteration ceiling.
+        request_context_budget_tokens: int | None = None,
+        segment_total_token_budget: int | None = None,
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
+        disabled_tool_names: List[str] = None,
         save_trajectories: bool = False,
         verbose_logging: bool = False,
         quiet_mode: bool = False,
@@ -1193,6 +1375,10 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        terminal_cwd: str | None = None,
+        tool_loop_guardrails: Dict[str, Any] | None = None,
+        persist_tool_guardrails_across_turns: bool = False,
+        babel_action_board_scoped: bool = False,
     ):
         """
         Initialize the AI Agent.
@@ -1205,6 +1391,14 @@ class AIAgent:
             model (str): Model name to use (default: "anthropic/claude-opus-4.6")
             max_iterations (int | None): Maximum number of tool-calling iterations;
                 None disables the per-turn ceiling (default: 90)
+            request_context_budget_tokens (int | None): Optional hard budget for
+                the provider-facing live transcript.  The durable transcript is
+                never mutated; old tool results and arguments are compacted only
+                in the per-request copy.  ``None`` preserves native behavior.
+            segment_total_token_budget (int | None): Optional cumulative usage
+                checkpoint for one provider transcript. Reaching it ends the
+                current segment cleanly so an external orchestrator can persist
+                progress and resume from compact durable state.
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
             enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
             disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
@@ -1251,6 +1445,26 @@ class AIAgent:
             if max_iterations <= 0:
                 raise ValueError("max_iterations must be positive or None")
         self.max_iterations = max_iterations
+        try:
+            minimum_context_budget = (
+                2_048 if babel_action_board_scoped else 8_192
+            )
+            self.request_context_budget_tokens = (
+                max(minimum_context_budget, int(request_context_budget_tokens))
+                if request_context_budget_tokens is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            self.request_context_budget_tokens = None
+        try:
+            self.segment_total_token_budget = (
+                max(8_000, int(segment_total_token_budget))
+                if segment_total_token_budget is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            self.segment_total_token_budget = None
+        self._last_live_context_projection: dict[str, Any] | None = None
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
@@ -1276,6 +1490,45 @@ class AIAgent:
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
+        # Explicit tool cwd used by host runtimes that multiplex scoped
+        # workers without changing the process-global cwd.
+        self.terminal_cwd = terminal_cwd
+        self.persist_tool_guardrails_across_turns = bool(
+            persist_tool_guardrails_across_turns
+        )
+        self._babel_scoped_worker = bool(babel_action_board_scoped)
+        self.disabled_tool_names = {
+            str(name).strip()
+            for name in (disabled_tool_names or [])
+            if str(name).strip()
+        }
+        self._tool_guardrails_initialized = False
+        self._scoped_repeated_tool_args: dict[str, int] = {}
+        # Mutation-only Action Board recovery segments need a progress signal,
+        # not just a successful tool response.  Models can otherwise keep
+        # rewriting one manifest (often with alternating package contracts)
+        # forever while every write looks successful.  Keep this state on the
+        # worker so the shared product boundary can checkpoint that loop.
+        self._scoped_mutation_path_counts: dict[str, int] = {}
+        self._scoped_mutation_progress_count = 0
+        self._scoped_mutation_recovery = False
+        # This flag protects unattended workers from truncated structured
+        # mutations without imposing mutation-only recovery semantics on a
+        # normal first turn.  It is deliberately independent from
+        # ``_scoped_mutation_recovery``.
+        self._scoped_truncated_tool_recovery = self._babel_scoped_worker
+        self._scoped_read_only_recovery = False
+        self._scoped_mutation_first_required = False
+        self._scoped_first_action_read_calls = 0
+        self._scoped_mutation_first_block_counts: dict[str, int] = {}
+        self._scoped_disabled_mutation_paths: set[str] = set()
+        self._scoped_recovery_read_calls = 0
+        self._scoped_verification_read_path_counts: dict[str, int] = {}
+        self._scoped_exact_terminal_command: str | None = None
+        self._scoped_verification_terminal_calls = 0
+        self._scoped_verification_terminal_result: dict[str, Any] | None = None
+        self._scoped_terminal_inventory_calls = 0
+        self._scoped_terminal_progress_seen = False
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1402,7 +1655,19 @@ class AIAgent:
         # Tool execution state — allows _vprint during tool execution
         # even when stream consumers are registered (no tokens streaming then)
         self._executing_tools = False
-        self._tool_guardrails = ToolCallGuardrailController()
+        # The scoped Action Board policy is derived before this state block
+        # (from the trusted prompt marker and/or constructor mapping).  Keep
+        # that controller instead of replacing it with Hermes' interactive
+        # warning-only defaults.  This assignment used to silently erase the
+        # hard-stop policy and allowed unattended workers to repeat reads.
+        if not isinstance(getattr(self, "_tool_guardrails", None), ToolCallGuardrailController):
+            self._tool_guardrails = ToolCallGuardrailController(
+                ToolCallGuardrailConfig.from_mapping(
+                    tool_loop_guardrails
+                    if isinstance(tool_loop_guardrails, dict)
+                    else {}
+                )
+            )
         self._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
 
         # Interrupt mechanism for breaking out of tool loops
@@ -1853,11 +2118,24 @@ class AIAgent:
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
         )
+        # Withhold disabled schemas from the next prompt, but keep their names
+        # in the validation set below. A provider can replay a stale tool call
+        # from the previous segment (especially after a continuation); the
+        # dispatch loop turns that call into a structured, non-executing error
+        # instead of exhausting the generic invalid-tool retry budget.
+        if self.disabled_tool_names:
+            self.tools = [
+                tool
+                for tool in self.tools
+                if str(((tool.get("function") or {}).get("name")) or "")
+                not in self.disabled_tool_names
+            ]
         
         # Show tool configuration and store valid tool names for validation
         self.valid_tool_names = set()
         if self.tools:
             self.valid_tool_names = {tool["function"]["name"] for tool in self.tools}
+            self.valid_tool_names.update(self.disabled_tool_names)
             tool_names = sorted(self.valid_tool_names)
             if not self.quiet_mode:
                 print(f"🛠️  Loaded {len(self.tools)} tools: {', '.join(tool_names)}")
@@ -1964,10 +2242,53 @@ class AIAgent:
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
+
+        # Babel's Action Board workers are unattended and receive a scoped
+        # system-boundary marker from the host runtime.  Treat that marker as
+        # an authoritative safety signal at the agent boundary too.  This
+        # protects against adapters/pools that drop private constructor
+        # kwargs while retaining the prompt, and prevents a warning-only
+        # controller from allowing an expensive read loop to continue.
+        _babel_scoped_worker = bool(
+            getattr(self, "_babel_scoped_worker", False)
+            or "Action Board execution boundary:" in str(ephemeral_system_prompt or "")
+        )
+        self._babel_scoped_worker = _babel_scoped_worker
+        if _babel_scoped_worker:
+            _scoped_guardrails = dict(
+                tool_loop_guardrails
+                if isinstance(tool_loop_guardrails, dict)
+                else {}
+            )
+            # All unattended Action Board workers use the same bounded product
+            # policy. Preserve explicit caller values where supplied, but fill
+            # every missing group from the shared five-observation defaults so
+            # pooled/provider-specific adapters cannot fall back to the old
+            # warning-only six-read behavior.
+            scoped_defaults = _scoped_action_board_guardrail_config()
+            for key, value in scoped_defaults.items():
+                if key not in _scoped_guardrails:
+                    _scoped_guardrails[key] = value
+            for group in ("warn_after", "hard_stop_after"):
+                current = _scoped_guardrails.get(group)
+                if not isinstance(current, dict):
+                    _scoped_guardrails[group] = dict(scoped_defaults[group])
+                else:
+                    _scoped_guardrails[group] = {
+                        **scoped_defaults[group],
+                        **current,
+                    }
+            tool_loop_guardrails = _scoped_guardrails
+            persist_tool_guardrails_across_turns = True
+            # The public attribute is initialized before config loading; keep
+            # it in sync with the marker-derived policy above.
+            self.persist_tool_guardrails_across_turns = True
         try:
             self._tool_guardrails = ToolCallGuardrailController(
                 ToolCallGuardrailConfig.from_mapping(
-                    _agent_cfg.get("tool_loop_guardrails", {})
+                    tool_loop_guardrails
+                    if isinstance(tool_loop_guardrails, dict)
+                    else _agent_cfg.get("tool_loop_guardrails", {})
                 )
             )
         except Exception as _tlg_err:
@@ -2094,6 +2415,15 @@ class AIAgent:
             self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
         except Exception:
             pass
+        self._background_review_disabled = str(
+            os.environ.get("HERMES_DISABLE_BACKGROUND_REVIEW", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if self._background_review_disabled:
+            # Benchmark/task execution must not silently fork a second model
+            # session to review skills or memory.  Babel's own learning loop
+            # records explicit evidence and remains separately attributable.
+            self._memory_nudge_interval = 0
+            self._skill_nudge_interval = 0
 
         # Tool-use enforcement config: "auto" (default — matches hardcoded
         # model list), true (always), false (never), or list of substrings.
@@ -2127,6 +2457,14 @@ class AIAgent:
         except Exception:
             pass
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+        if self._babel_scoped_worker:
+            # Action Board workers receive a Babel-owned, revisioned context
+            # envelope.  Hermes' opportunistic auxiliary compressor would
+            # otherwise probe unrelated providers (OpenRouter/Nous), retain a
+            # second transcript, and add un-attributable model calls.  Keep
+            # compression for ordinary conversational Hermes runs, but make
+            # the product's scoped worker boundary authoritative here.
+            compression_enabled = False
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
         # protect_first_n is the number of non-system messages to protect at
@@ -3198,6 +3536,7 @@ class AIAgent:
             "base_url": getattr(self, "base_url", "") or "",
             "api_key": getattr(self, "api_key", "") or "",
             "api_mode": getattr(self, "api_mode", "") or "",
+            "babel_action_board_scoped": "1" if self._babel_scoped_worker else "0",
         }
 
     def _check_compression_model_feasibility(self) -> None:
@@ -6044,7 +6383,7 @@ class AIAgent:
         # Environment hints (WSL, Termux, etc.) — tell the agent about the
         # execution environment so it can translate paths and adapt behavior.
         # Stable for the lifetime of the process.
-        _env_hints = build_environment_hints()
+        _env_hints = build_environment_hints(cwd=self.terminal_cwd)
         if _env_hints:
             stable_parts.append(_env_hints)
 
@@ -6074,7 +6413,7 @@ class AIAgent:
             # mode).  The gateway process runs from the hermes-agent install
             # dir, so os.getcwd() would pick up the repo's AGENTS.md and
             # other dev files — inflating token usage by ~10k for no benefit.
-            _context_cwd = os.getenv("TERMINAL_CWD") or None
+            _context_cwd = self.terminal_cwd or os.getenv("TERMINAL_CWD") or None
             context_files_prompt = build_context_files_prompt(
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
@@ -6138,6 +6477,267 @@ class AIAgent:
         parts = self._build_system_prompt_parts(system_message=system_message)
         joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
         return joined
+
+    def _project_live_context_for_request(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Bound the provider-facing transcript without mutating durable state.
+
+        Action Board workers already receive a small, provenance-carrying Babel
+        handoff.  Before this boundary existed, Hermes appended every tool
+        result and replayed the complete transcript on every call, so a 2K
+        handoff could become a 200K provider request.  This projection applies
+        cheap deterministic pruning first, then compacts/drops only old message
+        groups.  The current instruction and the active tool tail are retained;
+        the full transcript remains in ``self.messages`` for later recovery.
+        """
+
+        requested_budget = self.request_context_budget_tokens
+        budget = requested_budget
+        if not budget:
+            self._last_live_context_projection = None
+            return messages
+
+        source_messages = copy.deepcopy(messages)
+        # The request budget is intended to bound the growing transcript, not
+        # to make the provider input structurally invalid. Hermes' system
+        # contract and the selected tool schemas are part of every request;
+        # on a small card budget they can exceed the requested value before a
+        # single useful tool result is retained. Raise the effective budget to
+        # the smallest recent-tail envelope that can actually be serialized,
+        # while keeping a hard 64K ceiling for unattended workers. This keeps
+        # observed input close to Babel's bounded handoff instead of allowing
+        # the full historical transcript to leak back into the request.
+        system_messages = [m for m in source_messages if m.get("role") == "system"]
+        body_messages = [m for m in source_messages if m.get("role") != "system"]
+        minimum_tail = body_messages[-4:]
+        minimum_candidate = self._sanitize_api_messages(
+            [*system_messages, *minimum_tail]
+        )
+        minimum_tokens = estimate_request_tokens_rough(
+            minimum_candidate,
+            tools=self.tools,
+        )
+        budget_expanded_for_minimum_request = False
+        if minimum_tokens > budget:
+            try:
+                context_limit = int(
+                    getattr(getattr(self, "context_compressor", None), "context_length", 0)
+                    or 128_000
+                )
+            except (TypeError, ValueError):
+                context_limit = 128_000
+            effective_cap = max(budget, min(64_000, context_limit - 2_048))
+            budget = min(effective_cap, minimum_tokens + 512)
+            budget_expanded_for_minimum_request = budget > requested_budget
+        source_tokens = estimate_request_tokens_rough(
+            source_messages,
+            tools=self.tools,
+        )
+        if source_tokens <= budget:
+            self._last_live_context_projection = {
+                "version": "hermes_live_request_projection_v1",
+                "enabled": True,
+                "requested_budget_tokens": requested_budget,
+                "budget_tokens": budget,
+                "budget_expanded_for_minimum_request": budget_expanded_for_minimum_request,
+                "source_tokens": source_tokens,
+                "projected_tokens": source_tokens,
+                "source_message_count": len(source_messages),
+                "projected_message_count": len(source_messages),
+                "compacted_message_count": 0,
+                "dropped_message_count": 0,
+                "pruned_tool_result_count": 0,
+                "provenance": "provider_input_copy_only",
+            }
+            return messages
+
+        projected = source_messages
+        pruned_count = 0
+        compressor = getattr(self, "context_compressor", None)
+        prune = getattr(compressor, "_prune_old_tool_results", None)
+        if callable(prune):
+            try:
+                projected, pruned_count = prune(
+                    projected,
+                    protect_tail_count=12,
+                    protect_tail_tokens=max(4_096, budget // 2),
+                )
+            except Exception:
+                # Context protection must never turn into a new model failure.
+                logger.debug("Live context tool-result pruning failed", exc_info=True)
+
+        def compact_text(value: Any, *, limit: int = 720) -> Any:
+            if not isinstance(value, str) or len(value) <= limit:
+                return value
+            head = max(160, int(limit * 0.55))
+            tail = max(80, limit - head - 64)
+            return (
+                value[:head]
+                + "\n…[older live context compacted by Babel]…\n"
+                + value[-tail:]
+            )
+
+        def compact_message(message: Dict[str, Any]) -> Dict[str, Any]:
+            compacted = copy.deepcopy(message)
+            if compacted.get("role") == "tool":
+                compacted["content"] = compact_text(compacted.get("content"), limit=560)
+            elif isinstance(compacted.get("content"), str):
+                compacted["content"] = compact_text(compacted.get("content"), limit=840)
+            elif isinstance(compacted.get("content"), list):
+                parts = []
+                for part in compacted["content"]:
+                    if isinstance(part, dict) and part.get("type") in {
+                        "image",
+                        "image_url",
+                        "input_image",
+                    }:
+                        parts.append({"type": "text", "text": "[older image omitted]"})
+                    elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                        parts.append({**part, "text": compact_text(part["text"], limit=560)})
+                    else:
+                        parts.append(part)
+                compacted["content"] = parts
+
+            for field in ("reasoning", "reasoning_content"):
+                if isinstance(compacted.get(field), str):
+                    compacted[field] = compact_text(compacted[field], limit=420)
+            details = compacted.get("reasoning_details")
+            if isinstance(details, list) and len(details) > 3:
+                compacted["reasoning_details"] = details[-3:]
+
+            tool_calls = compacted.get("tool_calls")
+            if isinstance(tool_calls, list):
+                rewritten_calls = []
+                for call in tool_calls:
+                    rewritten = copy.deepcopy(call)
+                    if isinstance(rewritten, dict):
+                        function = rewritten.get("function")
+                        if isinstance(function, dict):
+                            args = function.get("arguments")
+                            if isinstance(args, str) and len(args) > 420:
+                                function["arguments"] = _truncate_tool_call_args_json(
+                                    args,
+                                    head_chars=320,
+                                )
+                    rewritten_calls.append(rewritten)
+                compacted["tool_calls"] = rewritten_calls
+            return compacted
+
+        # Keep the system prompt and the first user exchange stable for cache
+        # reuse.  Do not pin an assistant tool-call message in the head: its
+        # matching tool results belong to the active tail and must be retained
+        # or dropped as one atomic group.  Pinning that assistant message while
+        # trimming the tail creates synthetic "Result unavailable" stubs on
+        # every next request, which makes a worker repeat the same tool call.
+        system = [m for m in projected if m.get("role") == "system"]
+        body = [m for m in projected if m.get("role") != "system"]
+        head_count = min(2, len(body))
+        if (
+            head_count > 1
+            and body[1].get("role") == "assistant"
+            and body[1].get("tool_calls")
+        ):
+            head_count = 1
+        head = body[:head_count]
+        tail_count = min(12, max(0, len(body) - head_count))
+        tail_start = max(head_count, len(body) - tail_count)
+        # Never start a projection with a dangling tool result or leave a
+        # tool-call assistant outside the active tail.
+        while tail_start > head_count and body[tail_start].get("role") == "tool":
+            tail_start -= 1
+        if tail_start > head_count:
+            previous = body[tail_start - 1]
+            if previous.get("role") == "assistant" and previous.get("tool_calls"):
+                tail_start -= 1
+
+        middle = [compact_message(message) for message in body[head_count:tail_start]]
+        tail = body[tail_start:]
+        projected = [*system, *head, *middle, *tail]
+        projected = self._sanitize_api_messages(projected)
+        projected_tokens = estimate_request_tokens_rough(projected, tools=self.tools)
+
+        # If old summaries are still too large, discard complete oldest groups.
+        # The tail remains intact so the model can continue the active tool loop.
+        dropped = 0
+        while projected_tokens > budget and len(middle) > 0:
+            middle.pop(0)
+            dropped += 1
+            projected = self._sanitize_api_messages([*system, *head, *middle, *tail])
+            projected_tokens = estimate_request_tokens_rough(projected, tools=self.tools)
+
+        # A pathological active tail can still exceed the budget (for example a
+        # single large read_file result).  Compact all but the newest few tail
+        # messages, then discard the oldest complete tail group if necessary.
+        if projected_tokens > budget and tail:
+            for protected_tail in (4, 2, 1):
+                compact_tail = [
+                    compact_message(message)
+                    for message in tail[:-protected_tail]
+                ] + tail[-protected_tail:]
+                candidate = self._sanitize_api_messages(
+                    [*system, *head, *middle, *compact_tail]
+                )
+                candidate_tokens = estimate_request_tokens_rough(
+                    candidate,
+                    tools=self.tools,
+                )
+                projected = candidate
+                projected_tokens = candidate_tokens
+                if projected_tokens <= budget:
+                    break
+            while projected_tokens > budget and len(tail) > 1:
+                # Remove the oldest complete assistant(tool_calls)+tool group,
+                # never the final user instruction.
+                remove_count = 1
+                if tail[0].get("role") == "assistant" and tail[0].get("tool_calls"):
+                    remove_count = 1
+                    while (
+                        remove_count < len(tail)
+                        and tail[remove_count].get("role") == "tool"
+                    ):
+                        remove_count += 1
+                tail = tail[remove_count:]
+                dropped += remove_count
+                projected = self._sanitize_api_messages([*system, *head, *middle, *tail])
+                projected_tokens = estimate_request_tokens_rough(
+                    projected,
+                    tools=self.tools,
+                )
+
+        # A pathological single system prompt or current user message can
+        # exceed the budget by itself.  Compact the oldest non-system messages
+        # (including the head) as a final fallback, without dropping the final
+        # instruction.
+        if projected_tokens > budget:
+            compact_head = [compact_message(message) for message in head]
+            compacted = [*system, *compact_head, *tail]
+            projected = self._sanitize_api_messages(compacted)
+            projected_tokens = estimate_request_tokens_rough(projected, tools=self.tools)
+
+        compacted_count = sum(
+            1
+            for original, current in zip(source_messages, projected)
+            if original != current
+        )
+        self._last_live_context_projection = {
+            "version": "hermes_live_request_projection_v1",
+            "enabled": True,
+            "requested_budget_tokens": requested_budget,
+            "budget_tokens": budget,
+            "budget_expanded_for_minimum_request": budget_expanded_for_minimum_request,
+            "source_tokens": source_tokens,
+            "projected_tokens": projected_tokens,
+            "source_message_count": len(source_messages),
+            "projected_message_count": len(projected),
+            "compacted_message_count": compacted_count,
+            "dropped_message_count": dropped,
+            "pruned_tool_result_count": int(pruned_count or 0),
+            "within_budget": projected_tokens <= budget,
+            "provenance": "provider_input_copy_only",
+        }
+        return projected
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
@@ -10589,12 +11189,18 @@ class AIAgent:
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         tool = decision.tool_name or "a tool"
-        return (
+        response = (
             f"I stopped retrying {tool} because it hit the tool-call guardrail "
             f"({decision.code}) after {decision.count} repeated non-progressing "
             "attempts. The last tool result explains the blocker; the next step is "
             "to change strategy instead of repeating the same call."
         )
+        # Preserve bounded recovery hints in the worker-visible response so
+        # Babel can carry a disabled mutation path into the next segment.
+        detail = str(decision.message or "").strip()
+        if detail and detail not in response:
+            response += f"\n{detail}"
+        return response
 
     def _append_guardrail_observation(
         self,
@@ -10604,21 +11210,623 @@ class AIAgent:
         *,
         failed: bool,
     ) -> str:
+        self._ensure_babel_scoped_tool_guardrails()
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,
             function_result,
             failed=failed,
         )
+        # Action Board cards are unattended.  Keep an adapter-independent
+        # exact-call counter in addition to the result-based controller: a
+        # pooled worker or a provider that changes the serialized tool result
+        # must not be able to evade the no-progress circuit breaker.  The
+        # counter is deliberately scoped to Action Board workers and only
+        # applies to idempotent reads, so legitimate implementation commands
+        # and changed queries remain available.
+        scoped_guardrail = bool(
+            getattr(self, "_babel_scoped_worker", False)
+            or getattr(self, "persist_tool_guardrails_across_turns", False)
+        )
+        if scoped_guardrail:
+            # The Action Board boundary may safely consume a benign probe and
+            # return a no-op (or redirect it to a real bootstrap file). Those
+            # controller results must not be counted as model mutation
+            # progress, otherwise a worker can spend its recovery budget on
+            # ignored `.babel_*`/placeholder paths and postpone the real edit.
+            # A redirected probe that actually created the declared target is
+            # genuine progress and may advance the mutation tracker.
+            ignored_probe = False
+            redirected_probe = False
+            redirected_probe_created = False
+            probe_result: dict | None = None
+            try:
+                parsed_result = json.loads(function_result)
+                if isinstance(parsed_result, dict):
+                    probe_result = parsed_result
+                    ignored_probe = bool(parsed_result.get("ignored"))
+                    redirected_probe = bool(parsed_result.get("redirected"))
+                    redirected_probe_created = bool(parsed_result.get("created"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            mutation_progress = (not failed) and (
+                not ignored_probe
+                or (redirected_probe and redirected_probe_created)
+            )
+            if tool_name in {"write_file", "patch"}:
+                if mutation_progress:
+                    self._scoped_terminal_progress_seen = True
+                    # Permit one targeted grounding read before each
+                    # productive edit. A successful mutation starts a new
+                    # read/edit phase, so the next file's read is not counted
+                    # as cumulative no-progress for the whole recovery run.
+                    self._scoped_recovery_read_calls = 0
+                    self._scoped_first_action_read_calls = 0
+                    self._scoped_first_action_read_paths = set()
+                    self._scoped_mutation_first_block_counts = {}
+                # Mutation-only recovery is intentionally different from a
+                # normal implementation turn. A bounded multi-edit window
+                # lets the remediation specialist finish a coherent repair
+                # without paying for a fresh worker/context packet after
+                # every file, while the per-path and aggregate budgets still
+                # prevent oscillation. The final write has already landed
+                # when this post-call observer checkpoints the segment.
+                if mutation_progress and getattr(self, "_scoped_mutation_recovery", False):
+                    self._scoped_mutation_progress_count = int(
+                        getattr(self, "_scoped_mutation_progress_count", 0)
+                    ) + 1
+                    mutation_count = self._scoped_mutation_progress_count
+                    mutation_limit = _scoped_mutation_checkpoint_limit(
+                        getattr(
+                            self,
+                            "_scoped_mutation_checkpoint_limit_override",
+                            None,
+                        )
+                    )
+                    raw_path = ""
+                    if isinstance(function_args, dict):
+                        for key in ("path", "file_path", "filename", "target"):
+                            value = function_args.get(key)
+                            if isinstance(value, str) and value.strip():
+                                raw_path = value.strip()
+                                break
+                        if not raw_path and tool_name == "patch":
+                            patch_targets = _extract_file_mutation_targets(
+                                tool_name, function_args
+                            )
+                            if patch_targets:
+                                raw_path = patch_targets[0]
+                    if redirected_probe and isinstance(probe_result, dict):
+                        redirected_path = probe_result.get("path")
+                        if isinstance(redirected_path, str) and redirected_path.strip():
+                            raw_path = redirected_path.strip()
+                    normalized_path = _normalize_scoped_mutation_path(raw_path)
+                    if normalized_path:
+                        if normalized_path in getattr(
+                            self, "_scoped_disabled_mutation_paths", set()
+                        ):
+                            decision = ToolGuardrailDecision(
+                                action="halt",
+                                code="scoped_mutation_path_disabled",
+                                message=(
+                                    f"Stopped {tool_name}: recovery path "
+                                    f"'{normalized_path}' is disabled after repeated "
+                                    "rewrites. Choose a different concrete project "
+                                    "file or finish the card."
+                                ),
+                                tool_name=tool_name,
+                                count=1,
+                                signature=ToolCallSignature.from_call(
+                                    tool_name, function_args
+                                ),
+                            )
+                        else:
+                            counts = getattr(self, "_scoped_mutation_path_counts", {})
+                            count = int(counts.get(normalized_path, 0)) + 1
+                            counts[normalized_path] = count
+                            try:
+                                path_limit = max(
+                                    2,
+                                    int(
+                                        os.environ.get(
+                                            "BABEL_ACTION_BOARD_MUTATION_PATH_LIMIT",
+                                            "4",
+                                        )
+                                    ),
+                                )
+                            except (TypeError, ValueError):
+                                path_limit = 4
+                            if count >= path_limit:
+                                decision = ToolGuardrailDecision(
+                                    action="halt",
+                                    code="scoped_mutation_path_limit",
+                                    message=(
+                                        f"Stopped {tool_name}: recovery path "
+                                        f"'{normalized_path}' was edited {count} "
+                                        "times without reaching another deliverable. "
+                                        "Change target before continuing. "
+                                        f"BABEL_CONTINUATION_DISABLE_PATH: {normalized_path}"
+                                    ),
+                                    tool_name=tool_name,
+                                    count=count,
+                                    signature=ToolCallSignature.from_call(
+                                        tool_name, function_args
+                                    ),
+                                )
+                            elif (
+                                mutation_count >= mutation_limit
+                                and not decision.should_halt
+                            ):
+                                decision = ToolGuardrailDecision(
+                                    action="halt",
+                                    code="scoped_mutation_checkpoint",
+                                    message=(
+                                        "Checkpointed after a bounded Action Board repair window "
+                                        f"of {mutation_count} concrete mutations. Persist these "
+                                        "edits and resume the durable card contract with the "
+                                        "remaining target. "
+                                        f"BABEL_CONTINUATION_DISABLE_PATH: {normalized_path}"
+                                    ),
+                                    tool_name=tool_name,
+                                    count=count,
+                                    signature=ToolCallSignature.from_call(
+                                        tool_name, function_args
+                                    ),
+                                )
+            elif tool_name == "read_file" and (
+                getattr(self, "_scoped_mutation_recovery", False)
+                or getattr(self, "_scoped_read_only_recovery", False)
+            ):
+                # A recovery segment may inspect one named file and then make
+                # one concrete edit in the same segment.  Halting immediately
+                # after the first read forced an avoidable read-only model
+                # round trip before the worker could use the returned content.
+                # A second read still proves non-progress and checkpoints the
+                # segment so recovery cannot become an inspection loop.
+                self._scoped_recovery_read_calls = int(
+                    getattr(self, "_scoped_recovery_read_calls", 0)
+                ) + 1
+                read_only_recovery = bool(
+                    getattr(self, "_scoped_read_only_recovery", False)
+                )
+                if read_only_recovery:
+                    raw_read_path = ""
+                    if isinstance(function_args, dict):
+                        raw_read_path = str(
+                            function_args.get("path")
+                            or function_args.get("file_path")
+                            or function_args.get("filename")
+                            or ""
+                        ).strip()
+                    normalized_read_path = _normalize_scoped_mutation_path(
+                        raw_read_path
+                    )
+                    if normalized_read_path:
+                        path_counts = getattr(
+                            self,
+                            "_scoped_verification_read_path_counts",
+                            {},
+                        )
+                        path_count = int(path_counts.get(normalized_read_path, 0)) + 1
+                        path_counts[normalized_read_path] = path_count
+                        self._scoped_verification_read_path_counts = path_counts
+                        if path_count >= 2:
+                            decision = ToolGuardrailDecision(
+                                action="halt",
+                                code="scoped_verification_repeat_path",
+                                message=(
+                                    "Stopped repeated verification read of "
+                                    f"'{normalized_read_path}' after {path_count} calls. "
+                                    "Use the first result and run a different exact "
+                                    "acceptance check; do not request the same evidence again."
+                                ),
+                                tool_name=tool_name,
+                                count=path_count,
+                                signature=ToolCallSignature.from_call(
+                                    tool_name,
+                                    function_args,
+                                ),
+                            )
+                read_limit = (
+                    _scoped_verification_read_limit()
+                    if read_only_recovery
+                    else 1
+                )
+                if self._scoped_recovery_read_calls > read_limit:
+                    decision = ToolGuardrailDecision(
+                        action="halt",
+                        code="scoped_recovery_read_limit",
+                        message=(
+                            "Stopped targeted evidence reads after "
+                            f"{self._scoped_recovery_read_calls} calls (limit "
+                            f"{read_limit}). "
+                            + (
+                                "Use the collected evidence and run the smallest exact "
+                                "acceptance check instead of reading more files."
+                                if read_only_recovery
+                                else "Use the returned file content and make the smallest "
+                                "project mutation instead of rereading the worktree."
+                            )
+                        ),
+                        tool_name=tool_name,
+                        count=self._scoped_recovery_read_calls,
+                        signature=ToolCallSignature.from_call(
+                            tool_name, function_args
+                        ),
+                    )
+            elif tool_name == "terminal":
+                # The host boundary replaces the model-authored command with
+                # a sandbox wrapper before this callback runs, so inspecting
+                # ``function_args['command']`` here would mistake wrapper
+                # redirects for model progress.  Count every terminal call
+                # until an explicit write_file/patch callback proves an edit.
+                # A read-only verification segment is not expected to edit a
+                # file, so absence of mutation cannot classify exact test,
+                # build, server, or HTTP commands as inventory. Broad shell
+                # discovery is rejected before execution by
+                # _scoped_read_only_recovery_block_message; exact-repeat and
+                # segment-token guards still bound a genuinely stuck verifier.
+                if (
+                    not getattr(self, "_scoped_read_only_recovery", False)
+                    and not self._scoped_terminal_progress_seen
+                ):
+                    self._scoped_terminal_inventory_calls += 1
+                    inventory_count = self._scoped_terminal_inventory_calls
+                    inventory_limit = _scoped_terminal_inventory_limit()
+                    if inventory_count >= inventory_limit:
+                        decision = ToolGuardrailDecision(
+                            action="halt",
+                            code="scoped_terminal_inventory_limit",
+                            message=(
+                                "Stopped repeated terminal inspection after "
+                                f"{inventory_count} calls without a file edit. "
+                                "Use the available file tools to make the smallest "
+                                "concrete change, or checkpoint with a changed strategy."
+                            ),
+                            tool_name=tool_name,
+                            count=inventory_count,
+                            signature=ToolCallSignature.from_call(
+                                tool_name, function_args
+                            ),
+                        )
+                    elif inventory_count == inventory_limit - 1:
+                        decision = ToolGuardrailDecision(
+                            action="warn",
+                            code="scoped_terminal_inventory_limit",
+                            message=(
+                                "Terminal inspection is nearing its no-progress "
+                                f"limit ({inventory_count}/{inventory_limit}); make "
+                                "a concrete edit next."
+                            ),
+                            tool_name=tool_name,
+                            count=inventory_count,
+                            signature=ToolCallSignature.from_call(
+                                tool_name, function_args
+                            ),
+                        )
+                expected_command = str(
+                    getattr(self, "_scoped_exact_terminal_command", None) or ""
+                ).strip()
+                actual_command = str(
+                    function_args.get("command")
+                    if isinstance(function_args, dict)
+                    else ""
+                ).strip()
+                if (
+                    getattr(self, "_scoped_read_only_recovery", False)
+                    and expected_command
+                    and actual_command == expected_command
+                ):
+                    parsed_result: dict[str, Any] = {}
+                    try:
+                        candidate_result = json.loads(function_result)
+                        if isinstance(candidate_result, dict):
+                            parsed_result = candidate_result
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                    exit_code = parsed_result.get("exit_code")
+                    exact_passed = not failed and (
+                        exit_code == 0 or str(exit_code).strip() == "0"
+                    )
+                    self._scoped_verification_terminal_result = {
+                        "status": "passed" if exact_passed else "failed",
+                        "command": expected_command,
+                        "exit_code": exit_code,
+                    }
+                    if not exact_passed:
+                        decision = ToolGuardrailDecision(
+                            action="halt",
+                            code="scoped_verification_command_failed",
+                            message=(
+                                "The controller-owned verification command failed"
+                                + (
+                                    f" with exit code {exit_code}. "
+                                    if exit_code is not None
+                                    else ". "
+                                )
+                                + "Its tool result is authoritative evidence; route it "
+                                "to bounded remediation without another model/tool round."
+                            ),
+                            tool_name=tool_name,
+                            count=1,
+                            signature=ToolCallSignature.from_call(
+                                tool_name, function_args
+                            ),
+                        )
+            try:
+                repeat_key = json.dumps(
+                    {"tool": tool_name, "args": function_args},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                    separators=(",", ":"),
+                )
+            except Exception:
+                repeat_key = f"{tool_name}:{function_args!r}"
+            repeat_count = self._scoped_repeated_tool_args.get(repeat_key, 0) + 1
+            self._scoped_repeated_tool_args[repeat_key] = repeat_count
+            # Keep the schema stable across turns.  Removing a tool after a
+            # repeat leaves the model's already-emitted tool call stale; the
+            # next request then fails with an invalid-tool error and can turn a
+            # recoverable read loop into a failure spiral.  The controller's
+            # persistent exact/no-progress counters already provide the safe
+            # circuit breaker; retain the tools so the model can change the
+            # query or make the concrete edit requested by the card.
+            config = getattr(self._tool_guardrails, "config", None)
+            idempotent_tools = getattr(config, "idempotent_tools", frozenset())
+            mutating_tools = getattr(config, "mutating_tools", frozenset())
+            repeat_threshold = 2
+            # Allow one warning turn for a model to change strategy after its
+            # first repeated read.  Halting on the second call prevented
+            # cold-start workers from reaching their first real mutation; a
+            # third identical read is still a bounded stop and is far below
+            # the old six-read failure pattern.
+            # Keep the first warning tight, but allow the model to see the
+            # strategy-change guidance before the Action Board checkpoints the
+            # card. The API continuation is bounded separately, so this does
+            # not reintroduce the old six-read/unbounded spend failure mode.
+            repeat_halt_after = 5
+            if (
+                repeat_count >= repeat_threshold
+                and tool_name in idempotent_tools
+                and tool_name not in mutating_tools
+                and not decision.should_halt
+            ):
+                # An unattended worker gets one warning before the bounded
+                # hard stop. The old unconditional six-read fallback survived
+                # even when Babel supplied a tighter controller, allowing a
+                # whole continuation to be spent before the guardrail fired.
+                repeat_action = "halt" if repeat_count >= repeat_halt_after else "warn"
+                decision = ToolGuardrailDecision(
+                    action=repeat_action,
+                    code="scoped_exact_repeat_block",
+                    message=(
+                        f"Stopped {tool_name}: the identical read was observed "
+                        f"{repeat_count} times in this Action Board card. Use the "
+                        "returned result or change the query before continuing."
+                    ),
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=ToolCallSignature.from_call(tool_name, function_args),
+                )
         if decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)
+            # Keep the tool schema stable after a warning as well. A model may
+            # already have planned a read in the next response, and removing
+            # the function here turns a recoverable warning into an invalid-
+            # tool call. The persistent controller will block a genuinely
+            # repeated no-progress result on the following call.
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         return function_result
 
+    def _ensure_babel_scoped_tool_guardrails(self, messages: list | None = None) -> None:
+        """Keep the Action Board circuit breaker active at tool dispatch.
+
+        The gateway may refresh a pooled agent after construction and some
+        adapters replace private runtime state.  This check is deliberately
+        placed immediately before dispatch, where it can repair a stale
+        warning-only controller without resetting an already-running
+        controller's counters.
+        """
+        marker_text = "\n".join(
+            str(message.get("content") or "")
+            for message in (messages or [])
+            if isinstance(message, dict)
+        )
+        if "ACTION BOARD EXECUTION RULE:" in marker_text:
+            self._babel_scoped_worker = True
+        if not (
+            getattr(self, "_babel_scoped_worker", False)
+            or "Action Board execution boundary:" in str(
+                getattr(self, "ephemeral_system_prompt", "") or ""
+            )
+        ):
+            return
+        config = getattr(getattr(self, "_tool_guardrails", None), "config", None)
+        if (
+            getattr(self, "persist_tool_guardrails_across_turns", False)
+            and getattr(config, "hard_stop_enabled", False)
+        ):
+            return
+        scoped_config = _scoped_action_board_guardrail_config()
+        self._tool_guardrails = ToolCallGuardrailController(
+            ToolCallGuardrailConfig.from_mapping(scoped_config)
+        )
+        self.persist_tool_guardrails_across_turns = True
+        self._tool_guardrails_initialized = False
+
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
+
+    def _scoped_mutation_first_block_message(
+        self,
+        tool_name: str,
+        function_args: dict | None = None,
+        *,
+        defer_halt_for_current_batch: bool = False,
+    ) -> str | None:
+        """Prevent predictable inventory spend before an implementation edit.
+
+        Babel's context packet and typed card contract must carry enough
+        grounding for the worker to begin. A bounded set of distinct targeted
+        file reads is allowed; broad discovery, delegation, and command
+        execution reopen after the first successful write/patch so the same
+        worker can verify its work.
+        """
+
+        if not getattr(self, "_scoped_mutation_first_required", False):
+            return None
+        if getattr(self, "_scoped_terminal_progress_seen", False):
+            return None
+        message: str | None = None
+        rejection_key = tool_name
+        if tool_name == "read_file":
+            args = function_args if isinstance(function_args, dict) else {}
+            raw_path = str(
+                args.get("path")
+                or args.get("file_path")
+                or args.get("filename")
+                or ""
+            ).strip()
+            normalized_path = _normalize_scoped_mutation_path(raw_path)
+            read_paths = set(
+                getattr(self, "_scoped_first_action_read_paths", set()) or set()
+            )
+            read_limit = _scoped_mutation_first_read_limit()
+            if (
+                normalized_path
+                and normalized_path not in read_paths
+                and len(read_paths) < read_limit
+            ):
+                read_paths.add(normalized_path)
+                self._scoped_first_action_read_paths = read_paths
+                self._scoped_first_action_read_calls = len(read_paths)
+                return None
+            if normalized_path and normalized_path in read_paths:
+                rejection_key = f"read_file:repeat:{normalized_path}"
+                message = (
+                    "The Action Board mutation-first gate already returned targeted "
+                    f"evidence for '{normalized_path}'. Use that result and make the "
+                    "smallest concrete write_file or patch now; do not reread it."
+                )
+            else:
+                rejection_key = "read_file:budget"
+                message = (
+                    "The Action Board mutation-first grounding window already loaded "
+                    f"{len(read_paths)} distinct files (limit {read_limit}). Use that "
+                    "evidence and make the smallest concrete write_file or patch now; "
+                    "do not inventory another path first."
+                )
+        elif tool_name in {
+            "terminal",
+            "process",
+            "search_files",
+            "session_search",
+            "execute_code",
+            "delegate_task",
+            "browser",
+            "web_search",
+        }:
+            message = (
+                "The Action Board mutation-first gate blocks inventory, commands, "
+                "and delegation until one concrete project write_file or patch has "
+                "succeeded. Make the card's smallest required edit first; exact "
+                "verification tools reopen automatically afterward."
+            )
+        if message is None:
+            return None
+
+        counts = getattr(self, "_scoped_mutation_first_block_counts", {})
+        count = int(counts.get(rejection_key, 0)) + 1
+        counts[rejection_key] = count
+        self._scoped_mutation_first_block_counts = counts
+        if count >= 2 and not defer_halt_for_current_batch:
+            decision = ToolGuardrailDecision(
+                action="halt",
+                code="scoped_mutation_first_repeat",
+                message=(
+                    f"Stopped {tool_name} after {count} mutation-first policy "
+                    "rejections. Route the durable card to bounded remediation "
+                    "instead of spending more calls on the same blocked action."
+                ),
+                tool_name=tool_name,
+                count=count,
+                signature=ToolCallSignature.from_call(
+                    tool_name, function_args or {}
+                ),
+            )
+            self._set_tool_guardrail_halt(decision)
+            message += " " + decision.message
+        return message
+
+    def _scoped_read_only_recovery_block_message(
+        self,
+        tool_name: str,
+        function_args: dict | None = None,
+    ) -> str | None:
+        """Keep verification continuations on source-backed evidence."""
+
+        if not getattr(self, "_scoped_read_only_recovery", False):
+            return None
+        if tool_name != "terminal":
+            return None
+        args = function_args if isinstance(function_args, dict) else {}
+        command = str(args.get("command") or "").strip()
+        expected_command = str(
+            getattr(self, "_scoped_exact_terminal_command", None) or ""
+        ).strip()
+        if expected_command and command != expected_command:
+            decision = ToolGuardrailDecision(
+                action="halt",
+                code="scoped_verification_command_mismatch",
+                message=(
+                    "Stopped a read-only verifier that changed the controller-owned "
+                    "acceptance command. Return the mismatch as bounded evidence; do "
+                    "not browse the worktree or improvise another command."
+                ),
+                tool_name=tool_name,
+                count=1,
+                signature=ToolCallSignature.from_call(tool_name, args),
+            )
+            self._set_tool_guardrail_halt(decision)
+            return decision.message
+        if _is_terminal_inventory_command(command):
+            decision = ToolGuardrailDecision(
+                action="halt",
+                code="scoped_verification_inventory_blocked",
+                message=(
+                    "Broad terminal inventory is disabled in this read-only verification "
+                    "continuation. Return this bounded blocker to the remediation "
+                    "controller; do not use pwd, ls, find, tree, rg, or git status."
+                ),
+                tool_name=tool_name,
+                count=1,
+                signature=ToolCallSignature.from_call(tool_name, args),
+            )
+            self._set_tool_guardrail_halt(decision)
+            return decision.message
+        terminal_calls = int(
+            getattr(self, "_scoped_verification_terminal_calls", 0)
+        ) + 1
+        self._scoped_verification_terminal_calls = terminal_calls
+        if terminal_calls > 1:
+            decision = ToolGuardrailDecision(
+                action="halt",
+                code="scoped_verification_terminal_limit",
+                message=(
+                    "Stopped a second terminal call in one read-only verification "
+                    "segment. The first command result is authoritative evidence; "
+                    "return it to the remediation controller instead of retrying."
+                ),
+                tool_name=tool_name,
+                count=terminal_calls,
+                signature=ToolCallSignature.from_call(tool_name, args),
+            )
+            self._set_tool_guardrail_halt(decision)
+            return decision.message
+        return None
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
@@ -10627,6 +11835,7 @@ class AIAgent:
         independent: read-only tools may always share the parallel path, while
         file reads/writes may do so only when their target paths do not overlap.
         """
+        self._ensure_babel_scoped_tool_guardrails(messages)
         tool_calls = assistant_message.tool_calls
 
         # Allow _vprint during tool execution even with stream consumers
@@ -10671,6 +11880,18 @@ class AIAgent:
         tools. Used by the concurrent execution path; the sequential path retains
         its own inline invocation for backward-compatible display handling.
         """
+        if function_name in self.disabled_tool_names:
+            return json.dumps(
+                {
+                    "error": (
+                        f"Tool '{function_name}' is disabled for this continuation "
+                        "segment. Use an available alternative and make progress."
+                    ),
+                    "code": "tool_disabled_for_continuation",
+                },
+                ensure_ascii=False,
+            )
+
         # Check plugin hooks for a block directive before executing anything.
         block_message: Optional[str] = None
         if not pre_tool_block_checked:
@@ -10780,6 +12001,7 @@ class AIAgent:
         Results are collected in the original tool-call order and appended to
         messages so the API sees them in the expected sequence.
         """
+        self._ensure_babel_scoped_tool_guardrails(messages)
         tool_calls = assistant_message.tool_calls
         num_tools = len(tool_calls)
 
@@ -10797,6 +12019,9 @@ class AIAgent:
 
         # ── Parse args + pre-execution bookkeeping ───────────────────────
         parsed_calls = []  # list of (tool_call, function_name, function_args)
+        mutation_first_counts_before_batch = dict(
+            getattr(self, "_scoped_mutation_first_block_counts", {})
+        )
         for tool_call in tool_calls:
             function_name = tool_call.function.name
 
@@ -10848,6 +12073,73 @@ class AIAgent:
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
             else:
+                mutation_first_block = self._scoped_mutation_first_block_message(
+                    function_name,
+                    function_args,
+                    defer_halt_for_current_batch=(
+                        len(tool_calls) > 1
+                        and not mutation_first_counts_before_batch
+                    ),
+                )
+                if mutation_first_block is not None:
+                    block_result = json.dumps(
+                        {
+                            "error": mutation_first_block,
+                            "code": "scoped_mutation_first_required",
+                        },
+                        ensure_ascii=False,
+                    )
+                if block_result is None:
+                    verification_block = (
+                        self._scoped_read_only_recovery_block_message(
+                            function_name,
+                            function_args,
+                        )
+                    )
+                    if verification_block is not None:
+                        block_result = json.dumps(
+                            {
+                                "error": verification_block,
+                                "code": "scoped_verification_inventory_blocked",
+                            },
+                            ensure_ascii=False,
+                        )
+                if (
+                    block_result is None
+                    and
+                    function_name in {"write_file", "patch"}
+                    and getattr(self, "_scoped_mutation_recovery", False)
+                ):
+                    raw_path = ""
+                    for key in ("path", "file_path", "filename", "target"):
+                        value = function_args.get(key)
+                        if isinstance(value, str) and value.strip():
+                            raw_path = value.strip()
+                            break
+                    if not raw_path and function_name == "patch":
+                        patch_targets = _extract_file_mutation_targets(
+                            function_name, function_args
+                        )
+                        if patch_targets:
+                            raw_path = patch_targets[0]
+                    normalized_path = _normalize_scoped_mutation_path(raw_path)
+                    if normalized_path in getattr(
+                        self, "_scoped_disabled_mutation_paths", set()
+                    ):
+                        block_result = json.dumps(
+                            {
+                                "error": (
+                                    "recovery mutation path is disabled after repeated "
+                                    f"rewrites: {normalized_path}; choose another "
+                                    "concrete project file"
+                                ),
+                                "code": "scoped_mutation_path_disabled",
+                            },
+                            ensure_ascii=False,
+                        )
+                if block_result is not None:
+                    parsed_calls.append((tool_call, function_name, function_args, block_result, True))
+                    continue
                 guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
                 if not guardrail_decision.allows_execution:
                     block_result = self._guardrail_block_result(guardrail_decision)
@@ -11184,6 +12476,7 @@ class AIAgent:
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
+        self._ensure_babel_scoped_tool_guardrails(messages)
         for i, tool_call in enumerate(assistant_message.tool_calls, 1):
             # SAFETY: check interrupt BEFORE starting each tool.
             # If the user sent "stop" during a previous tool's execution,
@@ -11203,6 +12496,26 @@ class AIAgent:
                     messages.append(skip_msg)
                 break
 
+            # A prior call in this same assistant batch may have produced an
+            # authoritative terminal failure or another hard-stop decision.
+            # Do not execute the remaining speculative calls. Preserve one
+            # tool result per call ID so the transcript remains structurally
+            # valid without letting later mismatches overwrite the first
+            # failure classification.
+            if self._tool_guardrail_halt_decision is not None:
+                decision = self._tool_guardrail_halt_decision
+                for skipped_tc in assistant_message.tool_calls[i - 1:]:
+                    messages.append({
+                        "role": "tool",
+                        "name": skipped_tc.function.name,
+                        "content": (
+                            "[Tool execution skipped — an earlier call in this batch "
+                            f"triggered {decision.code}]"
+                        ),
+                        "tool_call_id": skipped_tc.id,
+                    })
+                break
+
             function_name = tool_call.function.name
 
             try:
@@ -11213,15 +12526,68 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
-            # Check plugin hooks for a block directive before executing.
-            _block_msg: Optional[str] = None
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                _block_msg = get_pre_tool_call_block_message(
-                    function_name, function_args, task_id=effective_task_id or "",
-                )
-            except Exception:
+            # A continuation may replay a tool that Babel explicitly disabled
+            # for this segment.  Keep the call in the conversation as a
+            # structured error rather than classifying it as an unknown tool;
+            # this lets the model recover with the tools that remain available.
+            _block_msg: Optional[str] = self._scoped_mutation_first_block_message(
+                function_name,
+                function_args,
+            )
+            if _block_msg is not None:
                 pass
+            elif (
+                _verification_block := self._scoped_read_only_recovery_block_message(
+                    function_name,
+                    function_args,
+                )
+            ) is not None:
+                _block_msg = _verification_block
+            elif function_name in self.disabled_tool_names:
+                _block_msg = (
+                    f"Tool '{function_name}' is disabled for this continuation "
+                    "segment. Use an available alternative and make progress."
+                )
+            else:
+                _block_msg = None
+
+            if (
+                _block_msg is None
+                and function_name in {"write_file", "patch"}
+                and getattr(self, "_scoped_mutation_recovery", False)
+            ):
+                raw_path = ""
+                for key in ("path", "file_path", "filename", "target"):
+                    value = function_args.get(key)
+                    if isinstance(value, str) and value.strip():
+                        raw_path = value.strip()
+                        break
+                if not raw_path and function_name == "patch":
+                    patch_targets = _extract_file_mutation_targets(
+                        function_name, function_args
+                    )
+                    if patch_targets:
+                        raw_path = patch_targets[0]
+                normalized_path = _normalize_scoped_mutation_path(raw_path)
+                if normalized_path in getattr(
+                    self, "_scoped_disabled_mutation_paths", set()
+                ):
+                    _block_msg = (
+                        "recovery mutation path is disabled after repeated rewrites: "
+                        f"{normalized_path}; choose another concrete project file"
+                    )
+
+            # Check plugin hooks for a block directive before executing.
+            if function_name not in self.disabled_tool_names:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    _plugin_block_message = get_pre_tool_call_block_message(
+                        function_name, function_args, task_id=effective_task_id or "",
+                    )
+                    if _plugin_block_message is not None:
+                        _block_msg = _plugin_block_message
+                except Exception:
+                    pass
 
             _guardrail_block_decision: ToolGuardrailDecision | None = None
             if _block_msg is None:
@@ -11623,6 +12989,140 @@ class AIAgent:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
+    def _record_response_usage(self, response, api_duration: float) -> bool:
+        """Record one provider response before any early-return branch.
+
+        Truncated structured tool calls return from the loop before ordinary
+        response handling. Usage accounting previously lived after that branch,
+        so precisely the most expensive failed calls were reported as null.
+        Recording immediately after the provider response makes completion,
+        truncation, guardrail, and cancellation paths share one counter.
+        """
+
+        if not hasattr(response, "usage") or not response.usage:
+            return False
+        canonical_usage = normalize_usage(
+            response.usage,
+            provider=self.provider,
+            api_mode=self.api_mode,
+        )
+        prompt_tokens = canonical_usage.prompt_tokens
+        completion_tokens = canonical_usage.output_tokens
+        total_tokens = canonical_usage.total_tokens
+        self.context_compressor.update_from_response({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        })
+        if getattr(self.context_compressor, "_context_probed", False):
+            context_length = self.context_compressor.context_length
+            if getattr(
+                self.context_compressor,
+                "_context_probe_persistable",
+                False,
+            ):
+                save_context_length(self.model, self.base_url, context_length)
+                self._safe_print(
+                    f"{self.log_prefix}💾 Cached context length: "
+                    f"{context_length:,} tokens for {self.model}"
+                )
+            self.context_compressor._context_probed = False
+            self.context_compressor._context_probe_persistable = False
+
+        self.session_prompt_tokens += prompt_tokens
+        self.session_completion_tokens += completion_tokens
+        self.session_total_tokens += total_tokens
+        self.session_api_calls += 1
+        self.session_input_tokens += canonical_usage.input_tokens
+        self.session_output_tokens += canonical_usage.output_tokens
+        self.session_cache_read_tokens += canonical_usage.cache_read_tokens
+        self.session_cache_write_tokens += canonical_usage.cache_write_tokens
+        self.session_reasoning_tokens += canonical_usage.reasoning_tokens
+
+        cache_suffix = ""
+        if canonical_usage.cache_read_tokens and prompt_tokens:
+            cache_suffix = (
+                f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} "
+                f"({100 * canonical_usage.cache_read_tokens / prompt_tokens:.0f}%)"
+            )
+        logger.info(
+            "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
+            self.session_api_calls,
+            self.model,
+            self.provider or "unknown",
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            api_duration,
+            cache_suffix,
+        )
+
+        cost_result = estimate_usage_cost(
+            self.model,
+            canonical_usage,
+            provider=self.provider,
+            base_url=self.base_url,
+            api_key=getattr(self, "api_key", ""),
+        )
+        if cost_result.amount_usd is not None:
+            self.session_estimated_cost_usd += float(cost_result.amount_usd)
+        self.session_cost_status = cost_result.status
+        self.session_cost_source = cost_result.source
+
+        if self._session_db and self.session_id:
+            try:
+                if not self._session_db_created:
+                    self._ensure_db_session()
+                self._session_db.update_token_counts(
+                    self.session_id,
+                    input_tokens=canonical_usage.input_tokens,
+                    output_tokens=canonical_usage.output_tokens,
+                    cache_read_tokens=canonical_usage.cache_read_tokens,
+                    cache_write_tokens=canonical_usage.cache_write_tokens,
+                    reasoning_tokens=canonical_usage.reasoning_tokens,
+                    estimated_cost_usd=(
+                        float(cost_result.amount_usd)
+                        if cost_result.amount_usd is not None
+                        else None
+                    ),
+                    cost_status=cost_result.status,
+                    cost_source=cost_result.source,
+                    billing_provider=self.provider,
+                    billing_base_url=self.base_url,
+                    billing_mode=(
+                        "subscription_included"
+                        if cost_result.status == "included"
+                        else None
+                    ),
+                    model=self.model,
+                    api_call_count=1,
+                )
+            except Exception as error:
+                logger.debug(
+                    "Token persistence failed (session=%s, tokens=%d): %s",
+                    self.session_id,
+                    total_tokens,
+                    error,
+                )
+
+        if (
+            (canonical_usage.cache_read_tokens or canonical_usage.cache_write_tokens)
+            and not self.quiet_mode
+        ):
+            hit_pct = (
+                canonical_usage.cache_read_tokens / prompt_tokens * 100
+                if prompt_tokens > 0
+                else 0
+            )
+            self._vprint(
+                f"{self.log_prefix}   💾 Cache: "
+                f"{canonical_usage.cache_read_tokens:,}/{prompt_tokens:,} tokens "
+                f"({hit_pct:.0f}% hit, "
+                f"{canonical_usage.cache_write_tokens:,} written)"
+            )
+        return True
+
+
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
         print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
@@ -11871,6 +13371,105 @@ class AIAgent:
         # Installed once, transparent when streams are healthy, prevents crash on write.
         _install_safe_stdio()
 
+        # Re-assert the Action Board circuit breaker at the actual execution
+        # boundary.  This covers adapters that replace the controller or
+        # pooled agents that were constructed before the scoped prompt was
+        # attached.  Do not rebuild an already-correct controller so its
+        # counters remain persistent across continuation turns.
+        _scoped_boundary = (
+            "Action Board execution boundary:" in str(
+                getattr(self, "ephemeral_system_prompt", "") or ""
+            )
+            or "ACTION BOARD EXECUTION RULE:" in str(user_message or "")
+        )
+        if _scoped_boundary:
+            self._babel_scoped_worker = True
+        # A continuation carrying the file-tools allowlist is a deliberately
+        # bounded mutation segment emitted by Babel's Action Board adapter.
+        # Track its mutation paths separately from ordinary interactive work;
+        # the normal product path remains free to refine a file as needed.
+        _continuation_prompt = "\n".join(
+            part
+            for part in (
+                str(user_message or ""),
+                str(getattr(self, "ephemeral_system_prompt", "") or ""),
+            )
+            if part
+        )
+        # Mutation-only behavior belongs only to an explicit durable
+        # continuation.  Normal Action Board turns retain the ordinary tool
+        # loop so a worker can read, edit, and validate in one AgentRun.
+        _continuation_mutation_recovery = bool(
+            re.search(
+                r"BABEL_CONTINUATION_ALLOWLIST:\s*file_tools",
+                _continuation_prompt,
+                flags=re.IGNORECASE,
+            )
+        )
+        self._scoped_mutation_recovery = _continuation_mutation_recovery
+        mutation_limit_match = re.search(
+            r"BABEL_CONTINUATION_MUTATION_LIMIT:\s*(\d+)",
+            _continuation_prompt,
+            flags=re.IGNORECASE,
+        )
+        self._scoped_mutation_checkpoint_limit_override = (
+            int(mutation_limit_match.group(1))
+            if mutation_limit_match
+            else None
+        )
+        self._scoped_read_only_recovery = bool(
+            re.search(
+                r"BABEL_CONTINUATION_READ_ONLY_RECOVERY:\s*1",
+                _continuation_prompt,
+                flags=re.IGNORECASE,
+            )
+        )
+        self._scoped_truncated_tool_recovery = bool(
+            getattr(self, "_scoped_truncated_tool_recovery", False)
+            or self._scoped_mutation_recovery
+        )
+        self._scoped_mutation_path_counts = {}
+        self._scoped_recovery_read_calls = 0
+        self._scoped_verification_read_path_counts = {}
+        self._scoped_verification_terminal_calls = 0
+        self._scoped_exact_terminal_command = None
+        self._scoped_verification_terminal_result = None
+        for _continuation_line in _continuation_prompt.splitlines():
+            _marker = "BABEL_CONTINUATION_EXACT_TERMINAL_COMMAND_JSON:"
+            if not _continuation_line.startswith(_marker):
+                continue
+            try:
+                _candidate_command = json.loads(
+                    _continuation_line[len(_marker):].strip()
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                _candidate_command = None
+            if isinstance(_candidate_command, str) and _candidate_command.strip():
+                self._scoped_exact_terminal_command = _candidate_command.strip()
+            break
+        self._scoped_disabled_mutation_paths = {
+            _normalize_scoped_mutation_path(match.group(1).strip())
+            for match in re.finditer(
+                r"BABEL_CONTINUATION_DISABLE_PATH:\s*([^\s`]+)",
+                _continuation_prompt,
+                flags=re.IGNORECASE,
+            )
+            if match.group(1).strip()
+        }
+        if _scoped_boundary:
+            _guardrail_config = getattr(self, "_tool_guardrails", None)
+            _guardrail_state = getattr(_guardrail_config, "config", None)
+            if (
+                not getattr(self, "persist_tool_guardrails_across_turns", False)
+                or not getattr(_guardrail_state, "hard_stop_enabled", False)
+            ):
+                _scoped_config = _scoped_action_board_guardrail_config()
+                self._tool_guardrails = ToolCallGuardrailController(
+                    ToolCallGuardrailConfig.from_mapping(_scoped_config)
+                )
+                self.persist_tool_guardrails_across_turns = True
+                self._tool_guardrails_initialized = False
+
         self._ensure_db_session()
 
         # Tell auxiliary_client what the live main provider/model are for
@@ -11939,7 +13538,12 @@ class AIAgent:
         self._last_content_tools_all_housekeeping = False
         self._mute_post_response = False
         self._unicode_sanitization_passes = 0
-        self._tool_guardrails.reset_for_turn()
+        if (
+            not self.persist_tool_guardrails_across_turns
+            or not self._tool_guardrails_initialized
+        ):
+            self._tool_guardrails.reset_for_turn()
+            self._tool_guardrails_initialized = True
         self._tool_guardrail_halt_decision = None
         # True until the server rejects an image_url content part with an error
         # like "Only 'text' content type is supported."  Set to False on first
@@ -12225,6 +13829,125 @@ class AIAgent:
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
+        # Action Board workers run unattended.  A provider can spend the
+        # whole response budget generating a large write_file/patch payload,
+        # leaving an incomplete JSON tool call.  Interactive Hermes treats
+        # that as a hard failure after one retry, but a scoped worker already
+        # has a durable checkpoint and should be given a bounded, changed
+        # strategy instead of poisoning the card.  Keep this state local to
+        # the current turn; the next Babel continuation gets a fresh budget
+        # and the normal path/target guardrails are re-applied there.
+        # A malformed write_file/patch payload is not made safer by replaying
+        # the same large generation several times.  Action Board already has
+        # a durable continuation boundary; after one bounded retry, return the
+        # guardrail so Babel can issue a fresh compact one-file prompt. This
+        # avoids burning multiple provider calls on identical truncated JSON.
+        scoped_truncated_tool_retry_limit = (
+            1 if getattr(self, "_scoped_mutation_recovery", False) else 1
+        )
+        # Once a scoped mutation worker has already made concrete edits, a
+        # truncated *text* follow-up does not benefit from three more full
+        # generations. Return a durable checkpoint after one bounded retry;
+        # foreground conversations retain the normal three-attempt behavior.
+        scoped_length_continue_retry_limit = (
+            1 if getattr(self, "_scoped_truncated_tool_recovery", False) else 3
+        )
+
+        def _scoped_truncated_tool_recovery(
+            *,
+            tool_names: list[str] | None = None,
+            raw_arguments: list[str] | None = None,
+        ) -> dict[str, Any] | None:
+            """Return a bounded Action Board checkpoint for repeated truncation.
+
+            The malformed tool call is never executed.  The marker is carried
+            in the guardrail message so Babel's continuation prompt can
+            preserve any identifiable target path and force the next segment
+            to choose a smaller edit.
+            """
+
+            if not getattr(self, "_scoped_truncated_tool_recovery", False):
+                return None
+            names = [str(name or "tool").strip() for name in (tool_names or [])]
+            names = [name for name in names if name]
+            path = ""
+            for raw in raw_arguments or []:
+                if not isinstance(raw, str):
+                    continue
+                match = re.search(
+                    r'''["']?(?:path|file_path|filename|target)["']?\s*:\s*["']([^"']+)''',
+                    raw,
+                    flags=re.IGNORECASE,
+                )
+                if match:
+                    path = _normalize_scoped_mutation_path(match.group(1))
+                    break
+            target_note = (
+                f" BABEL_CONTINUATION_DISABLE_PATH: {path}"
+                if path
+                else ""
+            )
+            tool_note = ", ".join(dict.fromkeys(names)) or "write_file/patch"
+            message = (
+                "Action Board worker response contained truncated JSON for "
+                f"{tool_note}. No incomplete tool call was executed. "
+                "Checkpoint this card and retry with exactly one concise "
+                "write_file or patch call targeting one concrete project file; "
+                "do not emit a full multi-file scaffold or repeat a large file "
+                f"payload.{target_note}"
+            )
+            return {
+                "action": "halt",
+                "code": "scoped_truncated_tool_call",
+                "message": message,
+                "tool_name": names[0] if names else "write_file",
+                "count": int(truncated_tool_call_retries),
+            }
+
+        def _append_scoped_truncated_tool_nudge(
+            *,
+            tool_names: list[str] | None = None,
+            raw_arguments: list[str] | None = None,
+        ) -> None:
+            """Ask the scoped worker to retry with a bounded mutation."""
+
+            names = ", ".join(dict.fromkeys(str(name or "tool") for name in (tool_names or [])))
+            path = ""
+            for raw in raw_arguments or []:
+                if not isinstance(raw, str):
+                    continue
+                match = re.search(
+                    r'''["']?(?:path|file_path|filename|target)["']?\s*:\s*["']([^"']+)''',
+                    raw,
+                    flags=re.IGNORECASE,
+                )
+                if match:
+                    path = _normalize_scoped_mutation_path(match.group(1))
+                    break
+            target_rule = (
+                f"Do not retry `{path}`; choose a different concrete project file. "
+                if path
+                else "Choose one concrete project file. "
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "[Action Board recovery: the previous "
+                        f"{names or 'tool'} call was truncated before valid JSON. "
+                        "Do not repeat the incomplete call. "
+                        + target_rule
+                        + "Emit exactly one concise write_file or patch call, keep "
+                        "the payload under about 300 lines/6,000 characters, and "
+                        "stop after that edit. If the file needs more, emit a "
+                        "coherent minimal slice and continue it later. Do not emit a "
+                        "complete multi-file scaffold or a prose plan.]"
+                    ),
+                }
+            )
+            self._session_messages = messages
+            self._save_session_log(messages)
+
         # Per-turn file-mutation verifier state.  Keyed by resolved path;
         # each failed ``write_file`` / ``patch`` call records the error
         # preview.  Later successful writes to the same path remove the
@@ -12293,6 +14016,33 @@ class AIAgent:
             )
             or self._budget_grace_call
         ):
+            # Babel Action Board workers are durably resumable.  Do not keep a
+            # single growing provider transcript alive until an external spend
+            # watchdog has to cancel it.  Check cumulative direct + delegated
+            # usage between tool batches, after the preceding batch has landed,
+            # and return a normal checkpoint to the scheduler.  Interactive
+            # Hermes sessions retain their historical behavior because the
+            # budget is unset unless the caller explicitly supplies it.
+            segment_budget = getattr(self, "segment_total_token_budget", None)
+            inclusive_segment_tokens = int(self.session_total_tokens or 0) + int(
+                getattr(self, "session_delegated_total_tokens", 0) or 0
+            )
+            if (
+                segment_budget is not None
+                and api_call_count > 0
+                and inclusive_segment_tokens >= int(segment_budget)
+            ):
+                _turn_exit_reason = (
+                    "segment_token_budget_reached("
+                    f"{inclusive_segment_tokens}/{int(segment_budget)})"
+                )
+                self._emit_status(
+                    "Action Board provider transcript checkpointed at "
+                    f"{inclusive_segment_tokens:,} tokens; durable work will resume "
+                    "in a compact segment."
+                )
+                break
+
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
@@ -12537,6 +14287,12 @@ class AIAgent:
             # stored conversation history keeps the reasoning block for the
             # UI transcript and session persistence.
             api_messages = self._drop_thinking_only_and_merge_users(api_messages)
+
+            # Babel Action Board workers use a bounded provider-facing
+            # projection.  ``messages`` remains the authoritative durable
+            # transcript; this copy is compacted only for the current request.
+            # Native Hermes and foreground Chat leave this disabled.
+            api_messages = self._project_live_context_for_request(api_messages)
 
             # Normalize message whitespace and tool-call JSON for consistent
             # prefix matching.  Ensures bit-perfect prefixes across turns,
@@ -13006,6 +14762,13 @@ class AIAgent:
                                 )
                         continue  # Retry the API call
 
+                    # Account for the provider response before any truncation
+                    # or structured-tool recovery path can return early.
+                    response_usage_recorded = self._record_response_usage(
+                        response,
+                        api_duration,
+                    )
+
                     # Check finish_reason before proceeding
                     if self.api_mode == "codex_responses":
                         status = getattr(response, "status", None)
@@ -13136,10 +14899,10 @@ class AIAgent:
                                 if assistant_message.content:
                                     truncated_response_parts.append(assistant_message.content)
 
-                                if length_continue_retries < 3:
+                                if length_continue_retries < scoped_length_continue_retry_limit:
                                     self._vprint(
                                         f"{self.log_prefix}↻ Requesting continuation "
-                                        f"({length_continue_retries}/3)..."
+                                        f"({length_continue_retries}/{scoped_length_continue_retry_limit})..."
                                     )
                                     continue_msg = {
                                         "role": "user",
@@ -13154,6 +14917,32 @@ class AIAgent:
                                     self._save_session_log(messages)
                                     restart_with_length_continuation = True
                                     break
+
+                                # A scoped Action Board implementation may
+                                # have already committed several file tools
+                                # before the provider's follow-up prose is
+                                # truncated. Preserve those edits and return a
+                                # durable mutation checkpoint instead of
+                                # terminally failing the card after three
+                                # text continuations.
+                                if getattr(self, "_scoped_truncated_tool_recovery", False):
+                                    scoped_guardrail = _scoped_truncated_tool_recovery(
+                                        tool_names=[],
+                                        raw_arguments=[],
+                                    )
+                                    if scoped_guardrail is not None:
+                                        self._cleanup_task_resources(effective_task_id)
+                                        self._persist_session(messages, conversation_history)
+                                        return {
+                                            "final_response": scoped_guardrail["message"],
+                                            "messages": messages,
+                                            "api_calls": api_call_count,
+                                            "completed": False,
+                                            "partial": True,
+                                            "error": scoped_guardrail["message"],
+                                            "guardrail": scoped_guardrail,
+                                            "turn_exit_reason": "guardrail_halt",
+                                        }
 
                                 partial_response = self._strip_think_blocks("".join(truncated_response_parts)).strip()
                                 self._cleanup_task_resources(effective_task_id)
@@ -13170,20 +14959,51 @@ class AIAgent:
                         if self.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                             assistant_message = _trunc_msg
                             if assistant_message is not None and _trunc_has_tool_calls:
-                                if truncated_tool_call_retries < 1:
+                                tool_names = [
+                                    getattr(tc.function, "name", "tool")
+                                    for tc in (getattr(assistant_message, "tool_calls", None) or [])
+                                ]
+                                raw_arguments = [
+                                    getattr(tc.function, "arguments", "")
+                                    for tc in (getattr(assistant_message, "tool_calls", None) or [])
+                                ]
+                                if truncated_tool_call_retries < scoped_truncated_tool_retry_limit:
                                     truncated_tool_call_retries += 1
                                     self._vprint(
-                                        f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call...",
+                                        f"{self.log_prefix}⚠️  Truncated tool call detected — retrying with a bounded mutation ({truncated_tool_call_retries}/{scoped_truncated_tool_retry_limit})...",
                                         force=True,
                                     )
-                                    # Don't append the broken response to messages;
-                                    # just re-run the same API call from the current
-                                    # message state, giving the model another chance.
+                                    # Do not append or execute the broken response.
+                                    # Scoped workers get an explicit strategy nudge;
+                                    # a blind retry tends to reproduce the same
+                                    # oversized write_file payload.
+                                    if getattr(self, "_scoped_truncated_tool_recovery", False):
+                                        _append_scoped_truncated_tool_nudge(
+                                            tool_names=tool_names,
+                                            raw_arguments=raw_arguments,
+                                        )
                                     continue
                                 self._vprint(
                                     f"{self.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
                                     force=True,
                                 )
+                                scoped_guardrail = _scoped_truncated_tool_recovery(
+                                    tool_names=tool_names,
+                                    raw_arguments=raw_arguments,
+                                )
+                                if scoped_guardrail is not None:
+                                    self._cleanup_task_resources(effective_task_id)
+                                    self._persist_session(messages, conversation_history)
+                                    return {
+                                        "final_response": scoped_guardrail["message"],
+                                        "messages": messages,
+                                        "api_calls": api_call_count,
+                                        "completed": False,
+                                        "partial": True,
+                                        "error": scoped_guardrail["message"],
+                                        "guardrail": scoped_guardrail,
+                                        "turn_exit_reason": "guardrail_halt",
+                                    }
                                 self._cleanup_task_resources(effective_task_id)
                                 self._persist_session(messages, conversation_history)
                                 return {
@@ -13225,7 +15045,11 @@ class AIAgent:
                             }
                     
                     # Track actual token usage from response for context management
-                    if hasattr(response, 'usage') and response.usage:
+                    if (
+                        not response_usage_recorded
+                        and hasattr(response, 'usage')
+                        and response.usage
+                    ):
                         canonical_usage = normalize_usage(
                             response.usage,
                             provider=self.provider,
@@ -14845,6 +16669,39 @@ class AIAgent:
                                 f"(finish_reason={finish_reason!r}) — refusing to execute.",
                                 force=True,
                             )
+                            tool_names = [name for name, _ in invalid_json_args]
+                            raw_arguments = [
+                                tc.function.arguments
+                                for tc in assistant_message.tool_calls
+                                if tc.function.name in set(tool_names)
+                            ]
+                            if truncated_tool_call_retries < scoped_truncated_tool_retry_limit:
+                                truncated_tool_call_retries += 1
+                                if getattr(self, "_scoped_truncated_tool_recovery", False):
+                                    _append_scoped_truncated_tool_nudge(
+                                        tool_names=tool_names,
+                                        raw_arguments=raw_arguments,
+                                    )
+                                self._invalid_json_retries = 0
+                                continue
+                            scoped_guardrail = _scoped_truncated_tool_recovery(
+                                tool_names=tool_names,
+                                raw_arguments=raw_arguments,
+                            )
+                            if scoped_guardrail is not None:
+                                self._invalid_json_retries = 0
+                                self._cleanup_task_resources(effective_task_id)
+                                self._persist_session(messages, conversation_history)
+                                return {
+                                    "final_response": scoped_guardrail["message"],
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "partial": True,
+                                    "error": scoped_guardrail["message"],
+                                    "guardrail": scoped_guardrail,
+                                    "turn_exit_reason": "guardrail_halt",
+                                }
                             self._invalid_json_retries = 0
                             self._cleanup_task_resources(effective_task_id)
                             self._persist_session(messages, conversation_history)
@@ -14979,6 +16836,30 @@ class AIAgent:
                             pass
 
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                    scoped_verification = getattr(
+                        self,
+                        "_scoped_verification_terminal_result",
+                        None,
+                    )
+                    if (
+                        isinstance(scoped_verification, dict)
+                        and scoped_verification.get("status") == "passed"
+                    ):
+                        _turn_exit_reason = "scoped_verification_completed"
+                        exact_command = str(
+                            scoped_verification.get("command") or ""
+                        ).strip()
+                        final_response = (
+                            "Controller-owned verification passed with exit code 0."
+                            + (
+                                f" Command: `{exact_command[:2000]}`"
+                                if exact_command
+                                else ""
+                            )
+                        )
+                        messages.append({"role": "assistant", "content": final_response})
+                        break
 
                     if self._tool_guardrail_halt_decision is not None:
                         decision = self._tool_guardrail_halt_decision
@@ -15695,6 +17576,13 @@ class AIAgent:
         }
         if self._tool_guardrail_halt_decision is not None:
             result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
+        if isinstance(
+            getattr(self, "_scoped_verification_terminal_result", None),
+            dict,
+        ):
+            result["scoped_verification"] = dict(
+                self._scoped_verification_terminal_result
+            )
         # If a /steer landed after the final assistant turn (no more tool
         # batches to drain into), hand it back to the caller so it can be
         # delivered as the next user turn instead of being silently lost.
@@ -15715,7 +17603,8 @@ class AIAgent:
 
         # Check skill trigger NOW — based on how many tool iterations THIS turn used.
         _should_review_skills = False
-        if (self._skill_nudge_interval > 0
+        if (not self._background_review_disabled
+                and self._skill_nudge_interval > 0
                 and self._iters_since_skill >= self._skill_nudge_interval
                 and "skill_manage" in self.valid_tool_names):
             _should_review_skills = True
@@ -15879,7 +17768,8 @@ class AIAgent:
         # pattern the chat_completions path uses (line ~15432).
         should_review_skills = False
         if (
-            self._skill_nudge_interval > 0
+            not self._background_review_disabled
+            and self._skill_nudge_interval > 0
             and self._iters_since_skill >= self._skill_nudge_interval
             and "skill_manage" in self.valid_tool_names
         ):

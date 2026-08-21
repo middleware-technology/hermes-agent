@@ -36,7 +36,12 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
-def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None = None) -> AIAgent:
+def _make_agent(
+    *tool_names: str,
+    max_iterations: int = 10,
+    config: dict | None = None,
+    **agent_kwargs,
+) -> AIAgent:
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs(*tool_names)),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -50,6 +55,7 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
+            **agent_kwargs,
         )
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
@@ -58,6 +64,21 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
     agent.compression_enabled = False
     agent.save_trajectories = False
     return agent
+
+
+def test_action_board_context_budget_can_use_compact_recovery_floor():
+    scoped = _make_agent(
+        "read_file",
+        request_context_budget_tokens=1_024,
+        babel_action_board_scoped=True,
+    )
+    interactive = _make_agent(
+        "read_file",
+        request_context_budget_tokens=1_024,
+    )
+
+    assert scoped.request_context_budget_tokens == 2_048
+    assert interactive.request_context_budget_tokens == 8_192
 
 
 def _seed_exact_failures(agent: AIAgent, tool_name: str, args: dict, count: int = 2) -> None:
@@ -134,6 +155,387 @@ def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution
     assert messages[0]["role"] == "tool"
     assert messages[0]["tool_call_id"] == "c-block"
     assert "repeated_exact_failure_block" in messages[0]["content"]
+
+
+def test_action_board_mutation_first_gate_reopens_tools_after_real_edit():
+    """One targeted read is allowed; inventory waits until a mutation lands."""
+
+    agent = _make_agent("read_file", "write_file", "terminal")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_first_required = True
+    messages = []
+
+    pre_mutation_calls = [
+        _mock_tool_call("read_file", '{"path":"package.json"}', "c-read-allowed"),
+        _mock_tool_call(
+            "write_file",
+            '{"path":"src/index.ts","content":"broken"}',
+            "c-write-failed",
+        ),
+    ]
+    post_mutation_calls = [
+        _mock_tool_call(
+            "write_file",
+            '{"path":"src/index.ts","content":"export {};"}',
+            "c-write",
+        ),
+        _mock_tool_call("terminal", '{"command":"npm test"}', "c-terminal-allowed"),
+    ]
+
+    with patch(
+        "run_agent.handle_function_call",
+        side_effect=[
+            json.dumps({"content": "{}"}),
+            json.dumps({"error": "write rejected"}),
+            json.dumps({"bytes_written": 10}),
+            json.dumps({"output": "tests passed", "exit_code": 0}),
+        ],
+    ) as mock_hfc:
+        for call in pre_mutation_calls:
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[call]),
+                messages,
+                "task-mutation-first",
+            )
+        assert agent._scoped_terminal_progress_seen is False
+        for call in post_mutation_calls:
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[call]),
+                messages,
+                "task-mutation-first",
+            )
+
+    assert mock_hfc.call_count == 4
+    by_id = {message["tool_call_id"]: message["content"] for message in messages}
+    assert "tests passed" in by_id["c-terminal-allowed"]
+    assert agent._scoped_terminal_progress_seen is True
+
+
+def test_action_board_mutation_first_gate_halts_repeated_policy_rejection():
+    agent = _make_agent("terminal")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_first_required = True
+    messages = []
+
+    with patch("run_agent.handle_function_call") as mock_hfc:
+        for index in range(2):
+            call = _mock_tool_call(
+                "terminal",
+                '{"command":"ls -la"}',
+                f"c-blocked-{index}",
+            )
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[call]),
+                messages,
+                "task-mutation-first-stop",
+            )
+
+    mock_hfc.assert_not_called()
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "scoped_mutation_first_repeat"
+    assert agent._tool_guardrail_halt_decision.count == 2
+
+
+def test_action_board_read_only_verifier_blocks_inventory_but_allows_exact_test():
+    inventory_agent = _make_agent("terminal")
+    inventory_agent._babel_scoped_worker = True
+    inventory_agent.persist_tool_guardrails_across_turns = True
+    inventory_agent._scoped_read_only_recovery = True
+    inventory_messages = []
+
+    inventory = _mock_tool_call(
+        "terminal",
+        '{"command":"ls -la"}',
+        "c-verifier-inventory",
+    )
+    with patch("run_agent.handle_function_call") as inventory_hfc:
+        inventory_agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[inventory]),
+            inventory_messages,
+            "task-verifier",
+        )
+
+    inventory_hfc.assert_not_called()
+    assert inventory_agent._tool_guardrail_halt_decision is not None
+    assert (
+        inventory_agent._tool_guardrail_halt_decision.code
+        == "scoped_verification_inventory_blocked"
+    )
+    assert "Broad terminal inventory is disabled" in inventory_messages[0]["content"]
+
+    exact_agent = _make_agent("terminal")
+    exact_agent._babel_scoped_worker = True
+    exact_agent.persist_tool_guardrails_across_turns = True
+    exact_agent._scoped_read_only_recovery = True
+    exact_agent._scoped_exact_terminal_command = "npm test -- --runInBand"
+    exact_messages = []
+    exact_test = _mock_tool_call(
+        "terminal",
+        '{"command":"npm test -- --runInBand"}',
+        "c-verifier-test",
+    )
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"output": "tests passed", "exit_code": 0}),
+    ) as exact_hfc:
+        exact_agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[exact_test]),
+            exact_messages,
+            "task-verifier",
+        )
+    exact_hfc.assert_called_once()
+    assert "tests passed" in exact_messages[0]["content"]
+
+
+def test_read_only_verifier_allows_distinct_evidence_batch_without_mutation():
+    agent = _make_agent("read_file")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_read_only_recovery = True
+
+    for index in range(4):
+        agent._append_guardrail_observation(
+            "read_file",
+            {"path": f"src/evidence-{index}.ts"},
+            json.dumps({"content": f"evidence {index}"}),
+            failed=False,
+        )
+
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def test_read_only_verifier_halts_second_read_of_same_path():
+    agent = _make_agent("read_file")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_read_only_recovery = True
+
+    for _index in range(2):
+        agent._append_guardrail_observation(
+            "read_file",
+            {"path": "package.json"},
+            json.dumps({"content": "{}"}),
+            failed=False,
+        )
+
+    assert agent._tool_guardrail_halt_decision is not None
+    assert (
+        agent._tool_guardrail_halt_decision.code
+        == "scoped_verification_repeat_path"
+    )
+
+
+def test_read_only_verifier_halts_after_one_exact_terminal_command():
+    agent = _make_agent("terminal")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_read_only_recovery = True
+
+    for index in range(2):
+        agent._append_guardrail_observation(
+            "terminal",
+            {"command": f"npm test -- --run evidence-{index}"},
+            json.dumps({"output": "checked", "exit_code": 0}),
+            failed=False,
+        )
+        block_message = agent._scoped_read_only_recovery_block_message(
+            "terminal",
+            {"command": f"npm test -- --run evidence-{index}"},
+        )
+        if index == 0:
+            assert block_message is None
+
+    assert agent._tool_guardrail_halt_decision is not None
+    assert (
+        agent._tool_guardrail_halt_decision.code
+        == "scoped_verification_terminal_limit"
+    )
+    assert agent._scoped_terminal_inventory_calls == 0
+
+
+def test_read_only_verifier_halts_when_exact_command_changes():
+    agent = _make_agent("terminal")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_read_only_recovery = True
+    agent._scoped_exact_terminal_command = "npm test"
+
+    message = agent._scoped_read_only_recovery_block_message(
+        "terminal",
+        {"command": "cat package.json"},
+    )
+
+    assert message is not None
+    assert agent._tool_guardrail_halt_decision is not None
+    assert (
+        agent._tool_guardrail_halt_decision.code
+        == "scoped_verification_command_mismatch"
+    )
+
+
+def test_read_only_exact_verification_pass_is_self_terminating():
+    agent = _make_agent("terminal")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_read_only_recovery = True
+    agent._scoped_exact_terminal_command = "npm test"
+
+    agent._append_guardrail_observation(
+        "terminal",
+        {"command": "npm test"},
+        json.dumps({"output": "tests passed", "exit_code": 0}),
+        failed=False,
+    )
+
+    assert agent._scoped_verification_terminal_result == {
+        "status": "passed",
+        "command": "npm test",
+        "exit_code": 0,
+    }
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def test_read_only_exact_verification_failure_routes_without_second_call():
+    agent = _make_agent("terminal")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_read_only_recovery = True
+    agent._scoped_exact_terminal_command = "npm test"
+
+    agent._append_guardrail_observation(
+        "terminal",
+        {"command": "npm test"},
+        json.dumps({"output": "tests failed", "exit_code": 1}),
+        failed=True,
+    )
+
+    assert agent._scoped_verification_terminal_result == {
+        "status": "failed",
+        "command": "npm test",
+        "exit_code": 1,
+    }
+    assert agent._tool_guardrail_halt_decision is not None
+    assert (
+        agent._tool_guardrail_halt_decision.code
+        == "scoped_verification_command_failed"
+    )
+
+
+def test_action_board_mutation_first_gate_allows_distinct_grounding_reads_and_blocks_rereads():
+    agent = _make_agent("read_file")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_first_required = True
+    messages = []
+    calls = [
+        _mock_tool_call("read_file", '{"path":"package.json"}', "c-read-one"),
+        _mock_tool_call("read_file", '{"path":".gitignore"}', "c-read-two"),
+        _mock_tool_call("read_file", '{"path":"tsconfig.json"}', "c-read-three"),
+        _mock_tool_call("read_file", '{"path":"vite.config.ts"}', "c-read-four"),
+    ]
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"content": "{}"}),
+    ) as mock_hfc:
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(content="", tool_calls=calls),
+            messages,
+            "task-mutation-first-parallel",
+        )
+
+    assert mock_hfc.call_count == 4
+    by_id = {message["tool_call_id"]: message["content"] for message in messages}
+    assert "content" in by_id["c-read-one"]
+    assert "content" in by_id["c-read-two"]
+    assert "content" in by_id["c-read-three"]
+    assert "content" in by_id["c-read-four"]
+    assert agent._tool_guardrail_halt_decision is None
+
+    # A duplicate path is corrected once and halted only when the provider
+    # ignores that exact correction, while new targeted paths remain useful.
+    for index in range(2):
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(
+                content="",
+                tool_calls=[
+                    _mock_tool_call(
+                        "read_file",
+                        '{"path":"package.json"}',
+                        f"c-read-repeat-{index}",
+                    )
+                ],
+            ),
+            messages,
+            "task-mutation-first-parallel",
+        )
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "scoped_mutation_first_repeat"
+
+
+def test_babel_action_board_prompt_enables_persistent_hard_stop_without_private_kwargs():
+    """The host boundary must survive adapters that drop scoped kwargs."""
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("search_files")),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://api.deepseek.com/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            ephemeral_system_prompt="Action Board execution boundary: worktree-local only",
+        )
+
+    assert agent.persist_tool_guardrails_across_turns is True
+    assert agent._tool_guardrails.config.hard_stop_enabled is True
+    assert agent._tool_guardrails.config.no_progress_block_after == 5
+
+
+def test_action_board_user_rule_marker_enables_dispatch_hard_stop():
+    """The scoped circuit breaker survives a pooled prompt refresh."""
+
+    agent = _make_agent("search_files")
+    agent.ephemeral_system_prompt = ""
+    messages = [
+        {
+            "role": "user",
+            "content": "ACTION BOARD EXECUTION RULE: inspect once, then edit.",
+        }
+    ]
+    result = json.dumps({"total_count": 1, "files": ["./package.json"]})
+
+    with patch("run_agent.handle_function_call", return_value=result) as mock_hfc:
+        for index in range(7):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(
+                    content="",
+                    tool_calls=[
+                        _mock_tool_call(
+                            "search_files",
+                            '{"pattern":"*","path":"."}',
+                            f"c-{index}",
+                        )
+                    ],
+                ),
+                messages,
+                "task-1",
+            )
+
+    assert agent.persist_tool_guardrails_across_turns is True
+    assert agent._tool_guardrails.config.hard_stop_enabled is True
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code in {
+        "idempotent_no_progress_block",
+        "scoped_exact_repeat_block",
+    }
+    assert mock_hfc.call_count == 5
 
 
 def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_messages():
@@ -268,8 +670,276 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
     assert result["guardrail"]["code"] == "repeated_exact_failure_block"
     assert result["guardrail"]["tool_name"] == "web_search"
 
-    assistant_tool_calls = [m for m in result["messages"] if m.get("role") == "assistant" and m.get("tool_calls")]
+    assistant_tool_calls = [
+        m for m in result["messages"]
+        if m.get("role") == "assistant" and m.get("tool_calls")
+    ]
     for assistant_msg in assistant_tool_calls:
         call_ids = [tc["id"] for tc in assistant_msg["tool_calls"]]
-        following_results = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") in call_ids]
+        following_results = [
+            m for m in result["messages"]
+            if m.get("role") == "tool" and m.get("tool_call_id") in call_ids
+        ]
         assert len(following_results) == len(call_ids)
+
+
+def test_exact_verification_run_completes_after_one_model_and_tool_call():
+    agent = _make_agent(
+        "terminal",
+        max_iterations=10,
+        babel_action_board_scoped=True,
+    )
+    exact_command = "npm test"
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="",
+        finish_reason="tool_calls",
+        tool_calls=[
+            _mock_tool_call(
+                "terminal",
+                json.dumps({"command": exact_command}),
+                "c-exact-verification",
+            )
+        ],
+    )
+    prompt = (
+        "BABEL_CONTINUATION_READ_ONLY_RECOVERY: 1\n"
+        "BABEL_CONTINUATION_EXACT_TERMINAL_COMMAND_JSON: "
+        + json.dumps(exact_command)
+    )
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"output": "tests passed", "exit_code": 0}),
+        ) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(prompt)
+
+    mock_hfc.assert_called_once()
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["api_calls"] == 1
+    assert result["turn_exit_reason"] == "scoped_verification_completed"
+    assert result["completed"] is True
+    assert result["final_response"].startswith(
+        "Controller-owned verification passed with exit code 0."
+    )
+    assert result["scoped_verification"] == {
+        "status": "passed",
+        "command": exact_command,
+        "exit_code": 0,
+    }
+    assert "guardrail" not in result
+
+
+def test_exact_verification_failure_stops_before_another_model_or_tool_call():
+    agent = _make_agent(
+        "terminal",
+        max_iterations=10,
+        babel_action_board_scoped=True,
+    )
+    exact_command = "npm run build"
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "terminal",
+                    json.dumps({"command": exact_command}),
+                    "c-exact-failed",
+                )
+            ],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "terminal",
+                    json.dumps({"command": "cat package.json"}),
+                    "c-inventory-must-not-run",
+                )
+            ],
+        ),
+    ]
+    prompt = (
+        "BABEL_CONTINUATION_READ_ONLY_RECOVERY: 1\n"
+        "BABEL_CONTINUATION_EXACT_TERMINAL_COMMAND_JSON: "
+        + json.dumps(exact_command)
+    )
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"output": "missing build.js", "exit_code": 1}),
+        ) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(prompt)
+
+    mock_hfc.assert_called_once()
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "scoped_verification_command_failed"
+    assert result["scoped_verification"] == {
+        "status": "failed",
+        "command": exact_command,
+        "exit_code": 1,
+    }
+
+
+def test_action_board_mutation_recovery_halts_oscillating_single_path():
+    """A recovery segment must move on instead of rewriting one manifest forever."""
+
+    agent = _make_agent("write_file")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_recovery = True
+    messages = []
+    calls = [
+        _mock_tool_call(
+            "write_file",
+            json.dumps({"path": "package.json", "content": f"{{\"revision\":{i}}}"}),
+            f"c-{i}",
+        )
+        for i in range(1, 5)
+    ]
+
+    with patch("run_agent.handle_function_call", return_value=json.dumps({"bytes_written": 20})):
+        for call in calls:
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[call]),
+                messages,
+                "task-recovery",
+            )
+
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "scoped_mutation_path_limit"
+    assert "package.json" in agent._tool_guardrail_halt_decision.message
+
+
+def test_action_board_mutation_recovery_respects_disabled_path():
+    agent = _make_agent("write_file")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_recovery = True
+    agent._scoped_disabled_mutation_paths = {"package.json"}
+    messages = []
+    call = _mock_tool_call(
+        "write_file",
+        json.dumps({"path": "package.json", "content": "{}"}),
+        "c-disabled",
+    )
+
+    with patch("run_agent.handle_function_call", return_value=json.dumps({"bytes_written": 2})) as mock_hfc:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[call]),
+            messages,
+            "task-recovery",
+        )
+
+    mock_hfc.assert_not_called()
+    assert messages and "recovery mutation path is disabled" in messages[0]["content"]
+
+
+def test_action_board_mutation_recovery_respects_disabled_dotfile_path():
+    """Dotfiles keep their leading dot across recovery path normalization."""
+
+    agent = _make_agent("write_file")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_recovery = True
+    agent._scoped_disabled_mutation_paths = {".env.example"}
+    messages = []
+    call = _mock_tool_call(
+        "write_file",
+        json.dumps({"path": ".env.example", "content": "PORT=4179\n"}),
+        "c-disabled-dotfile",
+    )
+
+    with patch("run_agent.handle_function_call", return_value=json.dumps({"bytes_written": 11})) as mock_hfc:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[call]),
+            messages,
+            "task-recovery-dotfile",
+        )
+
+    mock_hfc.assert_not_called()
+    assert messages and "recovery mutation path is disabled" in messages[0]["content"]
+
+
+def test_action_board_mutation_recovery_tracks_patch_mode_targets():
+    """V4A patch calls must share the write_file path budget."""
+
+    agent = _make_agent("patch")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_recovery = True
+    messages = []
+    calls = [
+        _mock_tool_call(
+            "patch",
+            json.dumps(
+                {
+                    "mode": "patch",
+                    "patch": (
+                        "*** Begin Patch\n"
+                        "*** Update File: package.json\n"
+                        f"@@\n-{{\"revision\":{i - 1}}}\n+{{\"revision\":{i}}}\n"
+                        "*** End Patch"
+                    ),
+                }
+            ),
+            f"patch-{i}",
+        )
+        for i in range(1, 5)
+    ]
+
+    with patch("run_agent.handle_function_call", return_value=json.dumps({"success": True})):
+        for call in calls:
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[call]),
+                messages,
+                "task-recovery-patch",
+            )
+
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "scoped_mutation_path_limit"
+    assert "package.json" in agent._tool_guardrail_halt_decision.message
+
+
+def test_action_board_mutation_recovery_matches_absolute_worktree_path():
+    agent = _make_agent("write_file")
+    agent._babel_scoped_worker = True
+    agent.persist_tool_guardrails_across_turns = True
+    agent._scoped_mutation_recovery = True
+    agent._scoped_disabled_mutation_paths = {"server/index.ts"}
+    messages = []
+    call = _mock_tool_call(
+        "write_file",
+        json.dumps(
+            {
+                "path": (
+                    "/private/tmp/run/checkouts/.babel-worktrees/card-123/"
+                    "server/index.ts"
+                ),
+                "content": "export {};",
+            }
+        ),
+        "c-absolute-disabled",
+    )
+
+    with patch("run_agent.handle_function_call", return_value=json.dumps({"bytes_written": 11})) as mock_hfc:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[call]),
+            messages,
+            "task-recovery-absolute",
+        )
+
+    mock_hfc.assert_not_called()
+    assert messages and "recovery mutation path is disabled" in messages[0]["content"]

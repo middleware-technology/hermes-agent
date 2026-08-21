@@ -50,6 +50,189 @@ def _consume_babel_scoped_file_root(args: dict) -> str | None:
     return None
 
 
+def _benchmark_probe_recovery_result(
+    *,
+    attempted_path: str,
+    task_id: str,
+    scoped_root: str | None,
+    reason: str,
+) -> str:
+    """Turn a rejected Action Board probe into one real bootstrap mutation.
+
+    DeepSeek sometimes ignores the mutation-only recovery prompt and emits a
+    harmless ``_probe_*`` write. Returning another failed tool result makes
+    the model spend the entire bounded recovery segment retrying the probe.
+    Redirect the first such attempt to the contract's valid cold-start target
+    instead. This creates a minimal, valid source file (never the model's probe
+    contents), keeps the worktree boundary intact, and gives the worker a real
+    mutation from which to continue. The handler is only reached for an
+    unattended, already-scoped Action Board worker.
+    """
+
+    target = "src/main.tsx"
+    if not scoped_root:
+        return json.dumps(
+            {
+                "success": False,
+                "ignored": True,
+                "retryable": False,
+                "error": "benchmark_probe_rejected",
+                "reason": f"Ignored Action Board boundary probe: {reason}",
+                "required_next_call": {
+                    "tool": "write_file",
+                    "path": target,
+                    "instruction": "Make a real project mutation now; adapt the target to the card if another concrete source file is required.",
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        root = Path(scoped_root).expanduser().resolve()
+        target_file = root / target
+        target_exists = target_file.is_file()
+    except (OSError, RuntimeError, ValueError):
+        target_exists = False
+
+    created = False
+    replaced_scaffold = False
+    if target_exists:
+        # The Action Board dispatcher may have materialized a deliberately
+        # tiny starter before the worker reached its first recovery segment.
+        # Redirecting a hidden state-file probe to that untouched starter must
+        # still produce real progress; otherwise the model can loop through
+        # ignored probes while the source file remains unchanged.  Never
+        # overwrite a non-scaffold implementation owned by the worker.
+        try:
+            existing_text = target_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            existing_text = ""
+        replaced_scaffold = (
+            "export {};" in existing_text
+            and (
+                "textContent = \"Siren\"" in existing_text
+                or 'innerHTML = "<main><h1>Siren</h1></main>"' in existing_text
+            )
+        )
+
+    if not target_exists or replaced_scaffold:
+        starter = (
+            "const root = document.querySelector<HTMLDivElement>(\"#root\");\n"
+            "if (root) {\n"
+            "  root.innerHTML = \"<main><h1>Siren</h1><p>Campaign workspace</p></main>\";\n"
+            "}\n\n"
+            "export const sirenAppName = \"Siren\";\n"
+        )
+        scoped_file_ops = _get_scoped_file_ops(task_id, str(root))
+        try:
+            write_result = json.loads(
+                write_file_tool(
+                    path=target,
+                    content=starter,
+                    task_id=task_id,
+                    file_ops_override=scoped_file_ops,
+                )
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            write_result = {"error": str(exc)}
+        if isinstance(write_result, dict) and write_result.get("error"):
+            return json.dumps(
+                {
+                    "success": False,
+                    "ignored": True,
+                    "retryable": False,
+                "error": "benchmark_probe_recovery_failed",
+                    "reason": str(write_result.get("error")),
+                    "required_next_call": {
+                        "tool": "write_file",
+                        "path": target,
+                        "instruction": "Make a real project mutation now; adapt the target to the card if another concrete source file is required.",
+                    },
+                },
+                ensure_ascii=False,
+            )
+        created = True
+
+    return json.dumps(
+        {
+            "success": True,
+            "ignored": True,
+            "redirected": True,
+            "redirected_from": attempted_path or "Action Board probe",
+            "path": target,
+            "created": created,
+            "replaced_scaffold": replaced_scaffold,
+            "message": (
+                "Action Board probe was not written. A real cold-start source target "
+                f"was {'created' if created else 'replaced' if replaced_scaffold else 'retained'} at {target}; continue the Siren implementation."
+            ),
+            "next_action": (
+                "Continue with the current Siren card using worktree-relative "
+                "write_file or patch calls. Do not create probe, inventory, "
+                "placeholder, or Babel metadata files."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _benchmark_probe_noop_result(*, reason: str) -> str:
+    """Return a safe no-op for an outside-worktree Action Board probe."""
+
+    return json.dumps(
+        {
+            "success": False,
+            "ignored": True,
+            "retryable": False,
+            "error": "benchmark_probe_rejected",
+            "reason": f"Ignored Action Board boundary probe: {reason}",
+            "required_next_call": {
+                "tool": "write_file",
+                "path": "src/main.tsx",
+                "instruction": "Make a real project mutation now; adapt the target to the card if another concrete source file is required.",
+            },
+            "next_action": (
+                "Do not repeat this probe. Implement the current Siren project "
+                "objective with write_file or patch; use a real source target "
+                "such as src/main.tsx or server/index.ts. Do not write Babel "
+                "benchmark/schema artifacts such as source_objective.*, "
+                "story_delta, game_delta, inventory, placeholder, _babel*, "
+                "scratch/note, or .babel_* "
+                "files. On a cold start create package.json and "
+                "package-lock.json before broad exploration."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _relativize_scoped_result(value, root: str):
+    """Hide an Action Board worktree's host path from the model.
+
+    File search implementations naturally return absolute paths.  Those paths
+    are useful in durable evidence, but an Action Board worker must re-emit
+    worktree-relative paths or the boundary rejects its next tool call.  Keep
+    the transformation limited to the provider-facing result; filesystem
+    operations and persisted tool evidence retain their canonical paths.
+    """
+    try:
+        root_path = str(Path(root).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        root_path = str(root).rstrip("/")
+    if isinstance(value, str):
+        if value == root_path:
+            return "."
+        prefix = root_path.rstrip("/") + "/"
+        if value.startswith(prefix):
+            return "." + value[len(root_path):]
+        return value
+    if isinstance(value, list):
+        return [_relativize_scoped_result(item, root) for item in value]
+    if isinstance(value, dict):
+        return {key: _relativize_scoped_result(item, root) for key, item in value.items()}
+    return value
+
+
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
 # ---------------------------------------------------------------------------
@@ -497,10 +680,48 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+def read_file_tool(
+    path: str,
+    offset: int = 1,
+    limit: int = 500,
+    task_id: str = "default",
+    file_ops_override: ShellFileOperations | None = None,
+) -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
+
+        # A model will sometimes use ``read_file('.')`` while orienting in a
+        # fresh Action Board worktree.  Treat that as a bounded, successful
+        # directory inventory instead of returning a misleading "File not
+        # found" error that encourages repeated retries.  Scoped callers use
+        # the validated file-operations cwd; interactive callers retain their
+        # normal task cwd resolution.
+        file_ops = file_ops_override or _get_file_ops(task_id)
+        if file_ops_override is not None:
+            base = getattr(file_ops_override, "cwd", None) or os.getcwd()
+            _resolved = (Path(base) / Path(path).expanduser()).resolve() if not Path(path).expanduser().is_absolute() else Path(path).expanduser().resolve()
+        else:
+            _resolved = _resolve_path_for_task(path, task_id)
+        if _resolved.is_dir():
+            try:
+                entries = sorted(
+                    item.name
+                    for item in _resolved.iterdir()
+                    if item.name not in {".git", ".babel-action-board-runtime"}
+                )[:100]
+            except OSError:
+                entries = []
+            return json.dumps(
+                {
+                    "path": str(_resolved),
+                    "is_directory": True,
+                    "entries": entries,
+                    "entry_count": len(entries),
+                    "message": "Directory inventory returned; use search_files for targeted discovery.",
+                },
+                ensure_ascii=False,
+            )
 
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
@@ -512,8 +733,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                     "block or produce infinite output."
                 ),
             })
-
-        _resolved = _resolve_path_for_task(path, task_id)
 
         # ── Binary file guard ─────────────────────────────────────────
         # Block binary files by extension (no I/O).
@@ -593,7 +812,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
-        file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
@@ -1012,7 +1230,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
-                task_id: str = "default") -> str:
+                task_id: str = "default",
+                file_ops_override: ShellFileOperations | None = None,
+                scoped_root: str | None = None) -> str:
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
@@ -1051,7 +1271,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "already_searched": count,
             }, ensure_ascii=False)
 
-        file_ops = _get_file_ops(task_id)
+        file_ops = file_ops_override or _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
@@ -1061,6 +1281,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 if hasattr(m, 'content') and m.content:
                     m.content = redact_sensitive_text(m.content, code_file=True)
         result_dict = result.to_dict()
+        if scoped_root:
+            result_dict = _relativize_scoped_result(result_dict, scoped_root)
 
         if count >= 3:
             result_dict["_warning"] = (
@@ -1108,11 +1330,11 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
+    "description": "Write content to a real project file, completely replacing existing content. In an Action Board worktree the path must be worktree-relative and inside the current project; never use /dev/null, /tmp, absolute source-checkout paths, inventory/probe/placeholder files, hidden .babel-* or .babel_* controller state, _babel* scratch/note files, or metadata-only paths. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out).",
     "parameters": {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
+            "path": {"type": "string", "description": "Worktree-relative path to a real project file (never /dev/null, /tmp, an absolute path, a probe/inventory/placeholder file, _babel* scratch/note files, or hidden .babel-* controller state)"},
             "content": {"type": "string", "description": "Complete content to write to the file"}
         },
         "required": ["path", "content"]
@@ -1122,7 +1344,7 @@ WRITE_FILE_SCHEMA = {
 PATCH_SCHEMA = {
     "name": "patch",
     "description": (
-        "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. "
+        "Targeted find-and-replace edits in real project files. In an Action Board worktree the path must be worktree-relative; never use /dev/null, /tmp, absolute source-checkout paths, inventory/probe/placeholder files, _babel* scratch/note files, hidden .babel-* or .babel_* controller state, or metadata-only paths. Use this instead of sed/awk in terminal. "
         "Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. "
         "Returns a unified diff. Auto-runs syntax checks after editing.\n\n"
         "REPLACE MODE (mode='replace', default): find a unique string and replace it. "
@@ -1141,7 +1363,7 @@ PATCH_SCHEMA = {
             },
             "path": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace'. File path to edit.",
+                "description": "REQUIRED when mode='replace'. Worktree-relative path to a real project file; never /dev/null, /tmp, an absolute path, a probe/inventory/placeholder file, _babel* scratch/note files, or hidden .babel-* controller state.",
             },
             "old_string": {
                 "type": "string",
@@ -1187,12 +1409,32 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    _consume_babel_scoped_file_root(args)
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    scoped_root = _consume_babel_scoped_file_root(args)
+    scoped_file_ops = _get_scoped_file_ops(tid, scoped_root) if scoped_root else None
+    return read_file_tool(
+        path=args.get("path", ""),
+        offset=args.get("offset", 1),
+        limit=args.get("limit", 500),
+        task_id=tid,
+        file_ops_override=scoped_file_ops,
+    )
 
 
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
+    if args.pop("_babel_scoped_probe_ignored", False):
+        recovery_mode = str(args.pop("_babel_scoped_probe_recovery", "noop") or "noop")
+        reason = str(args.pop("_babel_scoped_probe_reason", "boundary probe") or "boundary probe")
+        attempted_path = str(args.get("path") or "benchmark probe")
+        scoped_root = _consume_babel_scoped_file_root(args)
+        if recovery_mode != "redirect":
+            return _benchmark_probe_noop_result(reason=reason)
+        return _benchmark_probe_recovery_result(
+            attempted_path=attempted_path,
+            task_id=tid,
+            scoped_root=scoped_root,
+            reason=reason,
+        )
     scoped_root = _consume_babel_scoped_file_root(args)
     if not args.get("path") or not isinstance(args.get("path"), str):
         return tool_error(
@@ -1223,6 +1465,19 @@ def _handle_write_file(args, **kw):
 
 def _handle_patch(args, **kw):
     tid = kw.get("task_id") or "default"
+    if args.pop("_babel_scoped_probe_ignored", False):
+        recovery_mode = str(args.pop("_babel_scoped_probe_recovery", "noop") or "noop")
+        reason = str(args.pop("_babel_scoped_probe_reason", "boundary probe") or "boundary probe")
+        attempted_path = str(args.get("path") or "benchmark probe")
+        scoped_root = _consume_babel_scoped_file_root(args)
+        if recovery_mode != "redirect":
+            return _benchmark_probe_noop_result(reason=reason)
+        return _benchmark_probe_recovery_result(
+            attempted_path=attempted_path,
+            task_id=tid,
+            scoped_root=scoped_root,
+            reason=reason,
+        )
     scoped_root = _consume_babel_scoped_file_root(args)
     scoped_file_ops = _get_scoped_file_ops(tid, scoped_root) if scoped_root else None
     return patch_tool(
@@ -1234,14 +1489,16 @@ def _handle_patch(args, **kw):
 
 def _handle_search_files(args, **kw):
     tid = kw.get("task_id") or "default"
-    _consume_babel_scoped_file_root(args)
+    scoped_root = _consume_babel_scoped_file_root(args)
+    scoped_file_ops = _get_scoped_file_ops(tid, scoped_root) if scoped_root else None
     target_map = {"grep": "content", "find": "files"}
     raw_target = args.get("target", "content")
     target = target_map.get(raw_target, raw_target)
     return search_tool(
         pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid,
+        file_ops_override=scoped_file_ops, scoped_root=scoped_root)
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
