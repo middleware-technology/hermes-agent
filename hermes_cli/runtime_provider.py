@@ -225,6 +225,23 @@ def _resolve_runtime_from_pool_entry(
     target_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     model_cfg = model_cfg or _get_model_config()
+
+    # Codex CLI and Hermes intentionally keep separate refresh-token stores.
+    # The access token, however, is also valid for the shared Codex endpoint.
+    # When the user has recently authenticated the Codex CLI, its token can be
+    # newer than the Hermes device-code pool entry (the two refresh tokens may
+    # not be safely refreshed by both clients). Prefer that newer, same-account
+    # access token for this request without copying it into Hermes or refreshing
+    # either store. This prevents Babel from sending a stale Hermes token after
+    # the active Codex client has rotated credentials.
+    if provider == "openai-codex":
+        cli_runtime = _resolve_newer_codex_cli_runtime(
+            entry=entry,
+            requested_provider=requested_provider,
+        )
+        if cli_runtime is not None:
+            return cli_runtime
+
     # When the caller is resolving for a specific target model (e.g. a /model
     # mid-session switch), prefer that over the persisted model.default. This
     # prevents api_mode being computed from a stale config default that no
@@ -346,6 +363,95 @@ def _resolve_runtime_from_pool_entry(
         "source": getattr(entry, "source", "pool"),
         "credential_pool": pool,
         "requested_provider": requested_provider,
+    }
+
+
+def _resolve_newer_codex_cli_runtime(
+    *,
+    entry: PooledCredential,
+    requested_provider: str,
+) -> Optional[Dict[str, Any]]:
+    """Use a newer same-account Codex CLI access token without mutating auth.
+
+    Hermes and the Codex CLI must not race each other's refresh tokens. This is
+    therefore deliberately an access-token handoff only: the CLI token is read
+    as-is, and the normal Hermes credential pool remains untouched. If either
+    token lacks a comparable account/issued-at claim, the existing Hermes pool
+    entry remains authoritative.
+    """
+    source = str(getattr(entry, "source", "") or "").strip().lower()
+    if source not in {"device_code", "hermes-auth-store", "oauth", "chatgpt"}:
+        return None
+
+    try:
+        cli_tokens = auth_mod._import_codex_cli_tokens()
+    except Exception:
+        logger.debug("Unable to inspect Codex CLI credentials", exc_info=True)
+        return None
+    if not isinstance(cli_tokens, dict):
+        return None
+
+    hermes_access_token = str(
+        getattr(entry, "runtime_api_key", None)
+        or getattr(entry, "access_token", "")
+        or ""
+    ).strip()
+    cli_access_token = str(cli_tokens.get("access_token") or "").strip()
+    if not hermes_access_token or not cli_access_token:
+        return None
+
+    hermes_claims = auth_mod._decode_jwt_claims(hermes_access_token)
+    cli_claims = auth_mod._decode_jwt_claims(cli_access_token)
+    hermes_auth_claims = hermes_claims.get("https://api.openai.com/auth")
+    cli_auth_claims = cli_claims.get("https://api.openai.com/auth")
+    hermes_auth_claims = hermes_auth_claims if isinstance(hermes_auth_claims, dict) else {}
+    cli_auth_claims = cli_auth_claims if isinstance(cli_auth_claims, dict) else {}
+    hermes_account = hermes_auth_claims.get("chatgpt_account_id")
+    cli_account = cli_auth_claims.get("chatgpt_account_id")
+    hermes_issued_at = hermes_claims.get("iat")
+    cli_issued_at = cli_claims.get("iat")
+    if not hermes_account or not cli_account or hermes_account != cli_account:
+        return None
+    if not isinstance(hermes_issued_at, (int, float)) or not isinstance(
+        cli_issued_at, (int, float)
+    ):
+        return None
+    if cli_issued_at <= hermes_issued_at:
+        return None
+    if auth_mod._codex_access_token_is_expiring(cli_access_token, 0):
+        return None
+
+    model_cfg = _get_model_config()
+    api_mode = _maybe_apply_codex_app_server_runtime(
+        provider="openai-codex",
+        api_mode="codex_responses",
+        model_cfg=model_cfg,
+    )
+    pool_base_url = (
+        getattr(entry, "runtime_base_url", None)
+        or getattr(entry, "base_url", None)
+        or ""
+    )
+    base_url = (
+        str(pool_base_url).strip().rstrip("/")
+        or os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+        or DEFAULT_CODEX_BASE_URL
+    )
+
+    logger.info(
+        "Using newer same-account Codex CLI access token for provider=%s",
+        requested_provider,
+    )
+    return {
+        "provider": "openai-codex",
+        "api_mode": api_mode,
+        "base_url": base_url,
+        "api_key": cli_access_token,
+        "source": "codex-cli",
+        "requested_provider": requested_provider,
+        # Do not pass the stale Hermes pool into AIAgent: it would select the
+        # old credential again and defeat the handoff above.
+        "credential_pool": None,
     }
 
 

@@ -1,6 +1,23 @@
+import base64
+import json
+
 import pytest
 
 from hermes_cli import runtime_provider as rp
+
+
+def _jwt(*, account_id: str, issued_at: int, expires_at: int = 4_000_000_000) -> str:
+    payload = {
+        "iat": issued_at,
+        "exp": expires_at,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+        },
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    return f"header.{encoded}.signature"
 
 
 def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
@@ -25,6 +42,69 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["api_key"] == "pool-token"
     assert resolved["credential_pool"] is not None
     assert resolved["source"] == "manual"
+
+
+def test_resolve_runtime_provider_prefers_newer_same_account_codex_cli_token(monkeypatch):
+    hermes_token = _jwt(account_id="account-1", issued_at=100)
+    cli_token = _jwt(account_id="account-1", issued_at=200)
+
+    class _Entry:
+        access_token = hermes_token
+        source = "device_code"
+        base_url = "https://chatgpt.com/backend-api/codex"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "_import_codex_cli_tokens",
+        lambda: {"access_token": cli_token, "refresh_token": "cli-refresh"},
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_key"] == cli_token
+    assert resolved["source"] == "codex-cli"
+    assert resolved["credential_pool"] is None
+
+
+def test_resolve_runtime_provider_keeps_hermes_codex_token_for_other_account(monkeypatch):
+    hermes_token = _jwt(account_id="account-1", issued_at=100)
+    cli_token = _jwt(account_id="account-2", issued_at=200)
+
+    class _Entry:
+        access_token = hermes_token
+        source = "device_code"
+        base_url = "https://chatgpt.com/backend-api/codex"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        rp.auth_mod,
+        "_import_codex_cli_tokens",
+        lambda: {"access_token": cli_token, "refresh_token": "cli-refresh"},
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["api_key"] == hermes_token
+    assert resolved["source"] == "device_code"
+    assert resolved["credential_pool"] is not None
 
 
 def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkeypatch):
