@@ -67,6 +67,8 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 ]
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
+_openrouter_catalog_cache_time = 0.0
+_OPENROUTER_CATALOG_CACHE_TTL_SECONDS = 60 * 60
 
 
 # Fallback Vercel AI Gateway snapshot used when the live catalog is unavailable.
@@ -1104,19 +1106,29 @@ def fetch_openrouter_models(
     *,
     force_refresh: bool = False,
 ) -> list[tuple[str, str]]:
-    """Return the curated OpenRouter picker list, refreshed from the live catalog when possible."""
-    global _openrouter_catalog_cache
+    """Return every live tool-capable OpenRouter model, with curated models first."""
+    global _openrouter_catalog_cache, _openrouter_catalog_cache_time
 
-    if _openrouter_catalog_cache is not None and not force_refresh:
+    now = time.monotonic()
+    cache_is_fresh = (
+        _openrouter_catalog_cache is not None
+        and now - _openrouter_catalog_cache_time < _OPENROUTER_CATALOG_CACHE_TTL_SECONDS
+    )
+    if cache_is_fresh and not force_refresh:
         return list(_openrouter_catalog_cache)
 
     # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
-    # snapshot when the manifest is unreachable. Both are curated lists that
-    # drive the picker; the OpenRouter live /v1/models filter (tool support,
-    # free pricing) is applied on top either way.
+    # snapshot when the manifest is unreachable. The curated list controls
+    # ordering, while the live /v1/models response supplies newly released
+    # models without waiting for a Hermes manifest or Babel release.
+    try:
+        from hermes_cli.model_catalog import _urlopen_with_trusted_context
+    except Exception:
+        _urlopen_with_trusted_context = None
+
     try:
         from hermes_cli.model_catalog import get_curated_openrouter_models
-        remote = get_curated_openrouter_models()
+        remote = get_curated_openrouter_models(force_refresh=force_refresh)
     except Exception:
         remote = None
     fallback = list(remote) if remote else list(OPENROUTER_MODELS)
@@ -1127,7 +1139,11 @@ def fetch_openrouter_models(
             "https://openrouter.ai/api/v1/models",
             headers={"Accept": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if _urlopen_with_trusted_context is None:
+            response = urllib.request.urlopen(req, timeout=timeout)
+        else:
+            response = _urlopen_with_trusted_context(req, timeout=timeout)
+        with response as resp:
             payload = json.loads(resp.read().decode())
     except Exception:
         return list(_openrouter_catalog_cache or fallback)
@@ -1145,26 +1161,38 @@ def fetch_openrouter_models(
             continue
         live_by_id[mid] = item
 
-    curated: list[tuple[str, str]] = []
-    for preferred_id in preferred_ids:
-        live_item = live_by_id.get(preferred_id)
-        if live_item is None:
-            continue
-        # Hide models that don't advertise tool-calling support — hermes-agent
-        # requires it and surfacing them leads to immediate runtime failures
-        # when the user selects them. Ported from Kilo-Org/kilocode#9068.
-        if not _openrouter_model_supports_tools(live_item):
-            continue
-        desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
-        curated.append((preferred_id, desc))
+    discovered: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
 
-    if not curated:
+    def append_live_model(model_id: str) -> None:
+        if model_id in seen_ids:
+            return
+        live_item = live_by_id.get(model_id)
+        if live_item is None or not _openrouter_model_supports_tools(live_item):
+            return
+        desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
+        discovered.append((model_id, desc))
+        seen_ids.add(model_id)
+
+    for preferred_id in preferred_ids:
+        append_live_model(preferred_id)
+
+    for live_item in live_items:
+        if not isinstance(live_item, dict):
+            continue
+        model_id = str(live_item.get("id") or "").strip()
+        if not model_id:
+            continue
+        append_live_model(model_id)
+
+    if not discovered:
         return list(_openrouter_catalog_cache or fallback)
 
-    first_id, _ = curated[0]
-    curated[0] = (first_id, "recommended")
-    _openrouter_catalog_cache = curated
-    return list(curated)
+    first_id, _ = discovered[0]
+    discovered[0] = (first_id, "recommended")
+    _openrouter_catalog_cache = discovered
+    _openrouter_catalog_cache_time = now
+    return list(discovered)
 
 
 def model_ids(*, force_refresh: bool = False) -> list[str]:

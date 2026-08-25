@@ -82,6 +82,91 @@ class TestFetchOpenRouterModels:
             ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
         ]
 
+    def test_appends_new_live_tool_models_beyond_curated_manifest(self, monkeypatch):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"data":['
+                    b'{"id":"anthropic/claude-opus-4.6","pricing":{"prompt":"1","completion":"1"},'
+                    b'"supported_parameters":["tools"]},'
+                    b'{"id":"stealth/ox-alpha","pricing":{"prompt":"0","completion":"0"},'
+                    b'"supported_parameters":["reasoning","tools"]},'
+                    b'{"id":"image/no-tools","pricing":{"prompt":"0","completion":"0"},'
+                    b'"supported_parameters":["images"]}'
+                    b']}'
+                )
+
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        with (
+            patch(
+                "hermes_cli.model_catalog.get_curated_openrouter_models",
+                return_value=[("anthropic/claude-opus-4.6", "recommended")],
+            ),
+            patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()),
+        ):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        assert models == [
+            ("anthropic/claude-opus-4.6", "recommended"),
+            ("stealth/ox-alpha", "free"),
+        ]
+
+    def test_force_refresh_propagates_to_remote_manifest(self, monkeypatch):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"data":[{"id":"stealth/ox-alpha","supported_parameters":["tools"]}]}'
+
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        with (
+            patch(
+                "hermes_cli.model_catalog.get_curated_openrouter_models",
+                return_value=[("stealth/ox-alpha", "")],
+            ) as curated,
+            patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()),
+        ):
+            fetch_openrouter_models(force_refresh=True)
+
+        curated.assert_called_once_with(force_refresh=True)
+
+    def test_expired_in_process_cache_refreshes_automatically(self, monkeypatch):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"data":[{"id":"stealth/ox-alpha","supported_parameters":["tools"]}]}'
+
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", [("stale/model", "recommended")])
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache_time", 0.0)
+        monkeypatch.setattr(_models_mod, "_OPENROUTER_CATALOG_CACHE_TTL_SECONDS", 60.0)
+        monkeypatch.setattr(_models_mod.time, "monotonic", lambda: 61.0)
+        with (
+            patch(
+                "hermes_cli.model_catalog.get_curated_openrouter_models",
+                return_value=[("stealth/ox-alpha", "")],
+            ),
+            patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()) as live_fetch,
+        ):
+            models = fetch_openrouter_models()
+
+        assert models == [("stealth/ox-alpha", "recommended")]
+        assert live_fetch.called
+
     def test_falls_back_to_static_snapshot_on_fetch_failure(self, monkeypatch):
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
         with patch("hermes_cli.models.urllib.request.urlopen", side_effect=OSError("boom")):

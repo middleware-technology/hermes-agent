@@ -46,6 +46,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -75,6 +77,32 @@ _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
 # mtime, so calling code never has to think about this.
 _catalog_cache: dict[str, Any] | None = None
 _catalog_cache_source_mtime: float = 0.0
+
+
+def _trusted_ssl_context() -> ssl.SSLContext | None:
+    """Return an explicit CA-backed context for stdlib HTTPS requests.
+
+    Frozen macOS runtimes do not reliably discover the system trust store.
+    Prefer an operator-provided bundle, then Certifi (bundled by Babel), and
+    finally let ``urllib`` retain its platform default when neither exists.
+    """
+    for env_var in ("HERMES_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        ca_bundle = os.getenv(env_var, "").strip()
+        if ca_bundle and os.path.isfile(ca_bundle):
+            return ssl.create_default_context(cafile=ca_bundle)
+
+    try:
+        import certifi
+    except ImportError:
+        return None
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def _urlopen_with_trusted_context(request: urllib.request.Request, *, timeout: float):
+    context = _trusted_ssl_context()
+    if context is None:
+        return urllib.request.urlopen(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout, context=context)
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +151,7 @@ def _fetch_manifest(url: str, timeout: float) -> dict[str, Any] | None:
                 "User-Agent": _HERMES_USER_AGENT,
             },
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen_with_trusted_context(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
         logger.info("model catalog fetch failed (%s): %s", url, exc)
@@ -272,7 +300,7 @@ def _fetch_provider_override(provider: str) -> dict[str, Any] | None:
     return _fetch_manifest(override_url.strip(), DEFAULT_FETCH_TIMEOUT)
 
 
-def _get_provider_block(provider: str) -> dict[str, Any] | None:
+def _get_provider_block(provider: str, *, force_refresh: bool = False) -> dict[str, Any] | None:
     """Return the provider's manifest block, respecting per-provider overrides."""
     override = _fetch_provider_override(provider)
     if override is not None:
@@ -280,20 +308,20 @@ def _get_provider_block(provider: str) -> dict[str, Any] | None:
         if isinstance(block, dict):
             return block
 
-    catalog = get_catalog()
+    catalog = get_catalog(force_refresh=force_refresh)
     if not catalog:
         return None
     block = catalog.get("providers", {}).get(provider)
     return block if isinstance(block, dict) else None
 
 
-def get_curated_openrouter_models() -> list[tuple[str, str]] | None:
+def get_curated_openrouter_models(*, force_refresh: bool = False) -> list[tuple[str, str]] | None:
     """Return OpenRouter's curated ``[(id, description), ...]`` from the manifest.
 
     Returns ``None`` when the manifest is unavailable, so callers can fall
     back to their hardcoded list.
     """
-    block = _get_provider_block("openrouter")
+    block = _get_provider_block("openrouter", force_refresh=force_refresh)
     if not block:
         return None
     out: list[tuple[str, str]] = []
@@ -306,12 +334,12 @@ def get_curated_openrouter_models() -> list[tuple[str, str]] | None:
     return out or None
 
 
-def get_curated_nous_models() -> list[str] | None:
+def get_curated_nous_models(*, force_refresh: bool = False) -> list[str] | None:
     """Return Nous Portal's curated list of model ids from the manifest.
 
     Returns ``None`` when the manifest is unavailable.
     """
-    block = _get_provider_block("nous")
+    block = _get_provider_block("nous", force_refresh=force_refresh)
     if not block:
         return None
     out: list[str] = []

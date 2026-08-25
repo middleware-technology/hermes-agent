@@ -131,6 +131,47 @@ class TestFetchSuccess:
             model_catalog.get_catalog(force_refresh=True)
         assert fetch.call_count == 2
 
+    def test_manifest_fetch_uses_explicit_trusted_context(self, isolated_home):
+        from hermes_cli import model_catalog
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(_valid_manifest()).encode()
+
+        trusted_context = object()
+        with (
+            patch.object(model_catalog, "_trusted_ssl_context", return_value=trusted_context),
+            patch.object(model_catalog.urllib.request, "urlopen", return_value=_Resp()) as urlopen,
+        ):
+            result = model_catalog._fetch_manifest("https://catalog.example/models.json", 8.0)
+
+        assert result == _valid_manifest()
+        assert urlopen.call_args.kwargs["context"] is trusted_context
+
+    def test_trusted_context_uses_certifi_when_no_override_is_configured(
+        self, isolated_home, monkeypatch
+    ):
+        from hermes_cli import model_catalog
+
+        for env_var in ("HERMES_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+            monkeypatch.delenv(env_var, raising=False)
+
+        trusted_context = object()
+        with (
+            patch("certifi.where", return_value="/bundled/certifi.pem"),
+            patch.object(model_catalog.ssl, "create_default_context", return_value=trusted_context) as create,
+        ):
+            result = model_catalog._trusted_ssl_context()
+
+        assert result is trusted_context
+        create.assert_called_once_with(cafile="/bundled/certifi.pem")
+
 
 class TestFetchFailure:
     def test_network_failure_returns_empty_when_no_cache(self, isolated_home):
@@ -184,6 +225,17 @@ class TestCuratedAccessors:
             ("openai/gpt-5.4", ""),
             ("openrouter/elephant-alpha", "free"),
         ]
+
+    def test_openrouter_force_refresh_reaches_master_catalog(self, isolated_home):
+        from hermes_cli import model_catalog
+
+        with patch.object(
+            model_catalog, "get_catalog", return_value=_valid_manifest()
+        ) as get_catalog:
+            result = model_catalog.get_curated_openrouter_models(force_refresh=True)
+
+        assert result is not None
+        get_catalog.assert_called_once_with(force_refresh=True)
 
     def test_nous_returns_ids(self, isolated_home):
         from hermes_cli import model_catalog
