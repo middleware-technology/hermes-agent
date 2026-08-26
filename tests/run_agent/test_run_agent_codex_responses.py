@@ -176,6 +176,11 @@ class _FakeResponsesStream:
         return self._final_response
 
 
+class _RawDictionaryResponsesStream(_FakeResponsesStream):
+    def __iter__(self):
+        raise AttributeError("'dict' object has no attribute 'to_dict'")
+
+
 class _FakeCreateStream:
     def __init__(self, events):
         self._events = list(events)
@@ -483,6 +488,60 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert calls["create"] == 1
     assert create_stream.closed is True
     assert response.output[0].content[0].text == "streamed create ok"
+
+
+def test_run_codex_stream_recovers_from_raw_dictionary_sdk_events(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+    create_stream = _FakeCreateStream([
+        {"type": "response.created"},
+        {
+            "type": "response.completed",
+            "response": {
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "raw dict recovered"}],
+                }],
+                "status": "completed",
+                "model": "gpt-5-codex",
+            },
+        },
+    ])
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _RawDictionaryResponsesStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return create_stream
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(stream=_fake_stream, create=_fake_create)
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 1}
+    assert create_stream.closed is True
+    assert response.output[0].content[0].text == "raw dict recovered"
+
+
+def test_normalize_codex_response_accepts_a_raw_dictionary():
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    message, finish_reason = _normalize_codex_response({
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "dictionary response"}],
+        }],
+        "status": "completed",
+        "model": "gpt-5-codex",
+    })
+
+    assert message.content == "dictionary response"
+    assert finish_reason == "stop"
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):

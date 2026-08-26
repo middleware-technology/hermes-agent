@@ -266,6 +266,15 @@ def _make_run_env(env: dict) -> dict:
     if not _IS_WINDOWS and "/usr/bin" not in existing_path.split(":"):
         run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
 
+    # LocalEnvironment runs foreground commands with stdin detached.  Package
+    # managers such as pnpm otherwise mistake a Hermes worker for an
+    # interactive shell and abort when they need to replace ``node_modules``
+    # (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY).  Mark only this detached
+    # execution path as CI by default; explicit caller configuration still
+    # wins, and PTY-backed background sessions use the separate process
+    # registry environment path.
+    run_env.setdefault("CI", "true")
+
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
     # subprocess sees the override — the Python process keeps the real HOME.

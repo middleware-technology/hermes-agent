@@ -19,7 +19,7 @@ import pytest
 from agent.codex_responses_adapter import _chat_messages_to_responses_input, _normalize_codex_response, _preflight_codex_input_items
 
 import run_agent
-from run_agent import AIAgent
+from run_agent import AIAgent, StaleProviderResponseTimeout
 from agent.error_classifier import FailoverReason
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
@@ -2955,6 +2955,108 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
         assert result["interrupted"] is True
+
+    def test_stale_provider_response_gets_one_fresh_connection_retry(self, agent):
+        """A silent request may recover once without consuming the fallback."""
+        self._setup_agent(agent)
+        recovered = _mock_response(
+            content="Recovered on a fresh connection.", finish_reason="stop"
+        )
+        calls = {"api": 0}
+
+        def _fake_api_call(_api_kwargs):
+            calls["api"] += 1
+            if calls["api"] == 1:
+                raise StaleProviderResponseTimeout("no response data")
+            return recovered
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_try_activate_fallback") as fallback,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert calls["api"] == 2
+        fallback.assert_not_called()
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered on a fresh connection."
+
+    def test_codex_stream_activity_prevents_total_duration_timeout(self, agent):
+        """A long Codex response is bounded by inactivity, not wall time."""
+        import time
+
+        agent.api_mode = "codex_responses"
+
+        def _active_codex_stream(
+            _api_kwargs,
+            client=None,
+            on_first_delta=None,
+            on_stream_activity=None,
+        ):
+            for _ in range(12):
+                assert on_stream_activity is not None
+                on_stream_activity()
+                time.sleep(0.03)
+            return "long productive response"
+
+        with (
+            patch.object(agent, "_compute_non_stream_stale_timeout", return_value=0.08),
+            patch.object(agent, "_create_request_openai_client", return_value=MagicMock()),
+            patch.object(agent, "_close_request_openai_client"),
+            patch.object(agent, "_run_codex_stream", side_effect=_active_codex_stream),
+        ):
+            started = time.monotonic()
+            response = agent._interruptible_api_call(
+                {"model": "test-model", "input": []}
+            )
+            elapsed = time.monotonic() - started
+
+        assert elapsed > 0.30
+        assert response == "long productive response"
+
+    def test_second_stale_response_advances_configured_fallback(self, agent):
+        """Two silent requests switch models instead of issuing a third one."""
+        self._setup_agent(agent)
+        agent._fallback_chain = [
+            {"provider": "openai-codex", "model": "gpt-fallback"}
+        ]
+        agent._fallback_index = 0
+        agent.provider = "openrouter"
+        agent.model = "primary-model"
+        providers_seen = []
+
+        def _fake_api_call(_api_kwargs):
+            providers_seen.append((agent.provider, agent.model))
+            if len(providers_seen) <= 2:
+                raise StaleProviderResponseTimeout("no response data")
+            return _mock_response(content="Fallback recovered.", finish_reason="stop")
+
+        def _activate_fallback(*, reason=None):
+            assert reason == FailoverReason.timeout
+            agent._fallback_index = 1
+            agent._fallback_activated = True
+            agent.provider = "openai-codex"
+            agent.model = "gpt-fallback"
+            return True
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_try_activate_fallback", side_effect=_activate_fallback) as fallback,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert len(providers_seen) == 3
+        assert providers_seen[:2] == [("openrouter", "primary-model")] * 2
+        assert providers_seen[2] == ("openai-codex", "gpt-fallback")
+        fallback.assert_called_once()
+        assert result["completed"] is True
+        assert result["final_response"] == "Fallback recovered."
 
     def test_invalid_tool_name_retry(self, agent):
         """Model hallucinates an invalid tool name, agent retries and succeeds."""

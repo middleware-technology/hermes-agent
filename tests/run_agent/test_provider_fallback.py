@@ -183,6 +183,62 @@ class TestFallbackChainAdvancement:
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
 
 
+class TestTurnLocalProviderQuarantine:
+    def test_account_wide_403_skips_remaining_models_from_provider(self):
+        fbs = [
+            {"provider": "copilot", "model": "claude-haiku-4.5"},
+            {"provider": "copilot", "model": "gpt-5-mini"},
+            {"provider": "openai", "model": "gpt-4o"},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "copilot"
+
+        assert agent._quarantine_current_provider_for_turn(
+            status_code=403,
+            api_error=RuntimeError("This account is not licensed for Copilot"),
+        ) is True
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ) as mock_rpc:
+            assert agent._try_activate_fallback() is True
+
+        assert agent.provider == "openai"
+        assert agent._fallback_index == 3
+        assert mock_rpc.call_count == 1
+
+    def test_401_quarantines_only_the_failed_provider(self):
+        agent = _make_agent()
+        agent.provider = "deepseek"
+
+        assert agent._quarantine_current_provider_for_turn(
+            status_code=401,
+            api_error=RuntimeError("invalid key"),
+        ) is True
+        assert agent._fallback_unavailable_providers == {"deepseek"}
+
+    def test_rate_limit_does_not_quarantine_provider(self):
+        agent = _make_agent()
+        agent.provider = "openai-codex"
+
+        assert agent._quarantine_current_provider_for_turn(
+            status_code=429,
+            api_error=RuntimeError("usage limit reached for this model"),
+        ) is False
+        assert agent._fallback_unavailable_providers == set()
+
+    def test_model_specific_403_does_not_quarantine_provider(self):
+        agent = _make_agent()
+        agent.provider = "copilot"
+
+        assert agent._quarantine_current_provider_for_turn(
+            status_code=403,
+            api_error=RuntimeError("model gpt-5-mini is not available"),
+        ) is False
+        assert agent._fallback_unavailable_providers == set()
+
+
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
 
 

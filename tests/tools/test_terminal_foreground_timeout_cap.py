@@ -76,6 +76,27 @@ class TestForegroundTimeoutCap:
         assert "long-lived" in result["error"].lower()
         assert "background=true" in result["error"]
 
+    def test_babel_validated_sandbox_wrapper_skips_second_long_lived_scan(self):
+        """Quoted verifier data cannot make the trusted wrapper look like a dev server."""
+        from tools.terminal_tool import terminal_tool
+
+        wrapped = (
+            "/usr/bin/sandbox-exec -p '(version 1)' /bin/bash -lc "
+            "'jq -e '\"'\"'.build.beforeDevCommand == \"pnpm dev\"'\"'\"' "
+            "src-tauri/tauri.conf.json'"
+        )
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+             patch("tools.terminal_tool._start_cleanup_thread"):
+            mock_env = MagicMock()
+            mock_env.execute.return_value = {"output": "true", "returncode": 0}
+            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+                 patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+                result = json.loads(terminal_tool(command=wrapped, force=True))
+
+        assert result["error"] is None
+        assert mock_env.execute.call_args[0][0] == wrapped
+
     def test_foreground_allows_help_variant_for_server_command(self):
         """Informational variants like '--help' should not be blocked."""
         from tools.terminal_tool import terminal_tool

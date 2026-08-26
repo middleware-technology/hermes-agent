@@ -1812,7 +1812,7 @@ def terminal_tool(
 
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.
-        if not background:
+        if not background and not force:
             guidance = _foreground_background_guidance(command)
             if guidance:
                 return json.dumps({

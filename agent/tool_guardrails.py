@@ -303,20 +303,12 @@ class ToolCallGuardrailController:
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
 
-            if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
-                decision = ToolGuardrailDecision(
-                    action="halt",
-                    code="same_tool_failure_halt",
-                    message=(
-                        f"Stopped {tool_name}: it failed {same_count} times this turn. "
-                        "Stop retrying the same failing tool path and choose a different approach."
-                    ),
-                    tool_name=tool_name,
-                    count=same_count,
-                    signature=signature,
-                )
-                self._halt_decision = decision
-                return decision
+            # Tool names are capabilities, not requests. Distinct reads may
+            # legitimately miss several candidate paths before locating an
+            # existing source file, and distinct compiler/test commands may
+            # expose independent defects. Never terminate a turn from that
+            # aggregate count. Exact failing arguments and identical
+            # no-progress reads retain their separate hard stops.
 
             if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
                 return ToolGuardrailDecision(

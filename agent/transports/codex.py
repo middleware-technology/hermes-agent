@@ -219,7 +219,11 @@ class ResponsesApiTransport(ProviderTransport):
         """
         if response is None:
             return False
-        output = getattr(response, "output", None)
+        output = (
+            response.get("output")
+            if isinstance(response, dict)
+            else getattr(response, "output", None)
+        )
         if not isinstance(output, list) or not output:
             return False
         return True

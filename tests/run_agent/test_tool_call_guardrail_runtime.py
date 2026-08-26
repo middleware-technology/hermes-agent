@@ -238,7 +238,7 @@ def test_action_board_mutation_first_gate_halts_repeated_policy_rejection():
     assert agent._tool_guardrail_halt_decision.count == 2
 
 
-def test_action_board_read_only_verifier_blocks_inventory_but_allows_exact_test():
+def test_action_board_read_only_verifier_allows_inventory_and_exact_test():
     inventory_agent = _make_agent("terminal")
     inventory_agent._babel_scoped_worker = True
     inventory_agent.persist_tool_guardrails_across_turns = True
@@ -250,20 +250,19 @@ def test_action_board_read_only_verifier_blocks_inventory_but_allows_exact_test(
         '{"command":"ls -la"}',
         "c-verifier-inventory",
     )
-    with patch("run_agent.handle_function_call") as inventory_hfc:
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"output": "clean", "exit_code": 0}),
+    ) as inventory_hfc:
         inventory_agent._execute_tool_calls_sequential(
             SimpleNamespace(content="", tool_calls=[inventory]),
             inventory_messages,
             "task-verifier",
         )
 
-    inventory_hfc.assert_not_called()
-    assert inventory_agent._tool_guardrail_halt_decision is not None
-    assert (
-        inventory_agent._tool_guardrail_halt_decision.code
-        == "scoped_verification_inventory_blocked"
-    )
-    assert "Broad terminal inventory is disabled" in inventory_messages[0]["content"]
+    inventory_hfc.assert_called_once()
+    assert inventory_agent._tool_guardrail_halt_decision is None
+    assert "clean" in inventory_messages[0]["content"]
 
     exact_agent = _make_agent("terminal")
     exact_agent._babel_scoped_worker = True
@@ -327,7 +326,7 @@ def test_read_only_verifier_halts_second_read_of_same_path():
     )
 
 
-def test_read_only_verifier_halts_after_one_exact_terminal_command():
+def test_read_only_verifier_allows_multiple_distinct_exact_terminal_commands():
     agent = _make_agent("terminal")
     agent._babel_scoped_worker = True
     agent.persist_tool_guardrails_across_turns = True
@@ -347,11 +346,7 @@ def test_read_only_verifier_halts_after_one_exact_terminal_command():
         if index == 0:
             assert block_message is None
 
-    assert agent._tool_guardrail_halt_decision is not None
-    assert (
-        agent._tool_guardrail_halt_decision.code
-        == "scoped_verification_terminal_limit"
-    )
+    assert agent._tool_guardrail_halt_decision is None
     assert agent._scoped_terminal_inventory_calls == 0
 
 
@@ -793,8 +788,8 @@ def test_exact_verification_failure_stops_before_another_model_or_tool_call():
     }
 
 
-def test_action_board_mutation_recovery_halts_oscillating_single_path():
-    """A recovery segment must move on instead of rewriting one manifest forever."""
+def test_action_board_mutation_recovery_allows_progressive_single_path_reconciliation():
+    """Changed writes to one manifest are progress; identical loops are fenced elsewhere."""
 
     agent = _make_agent("write_file")
     agent._babel_scoped_worker = True
@@ -818,9 +813,7 @@ def test_action_board_mutation_recovery_halts_oscillating_single_path():
                 "task-recovery",
             )
 
-    assert agent._tool_guardrail_halt_decision is not None
-    assert agent._tool_guardrail_halt_decision.code == "scoped_mutation_path_limit"
-    assert "package.json" in agent._tool_guardrail_halt_decision.message
+    assert agent._tool_guardrail_halt_decision is None
 
 
 def test_action_board_mutation_recovery_respects_disabled_path():
@@ -882,8 +875,8 @@ def test_action_board_mutation_recovery_allows_distinct_grounding_reads():
     assert agent._tool_guardrail_halt_decision is None
 
 
-def test_action_board_mutation_recovery_honors_card_local_read_limit():
-    """The remediation contract can stop broad grounding before another model loop."""
+def test_action_board_mutation_recovery_has_no_aggregate_distinct_read_limit():
+    """Distinct causal reads remain available; repeated paths carry the loop fence."""
 
     agent = _make_agent("read_file")
     agent._babel_scoped_worker = True
@@ -906,9 +899,7 @@ def test_action_board_mutation_recovery_honors_card_local_read_limit():
         failed=False,
     )
 
-    assert agent._tool_guardrail_halt_decision is not None
-    assert agent._tool_guardrail_halt_decision.code == "scoped_recovery_read_limit"
-    assert "limit 1" in agent._tool_guardrail_halt_decision.message
+    assert agent._tool_guardrail_halt_decision is None
 
 
 def test_action_board_mutation_recovery_halts_repeated_grounding_path():
@@ -973,8 +964,8 @@ def test_action_board_mutation_recovery_respects_disabled_dotfile_path():
     assert messages and "recovery mutation path is disabled" in messages[0]["content"]
 
 
-def test_action_board_mutation_recovery_tracks_patch_mode_targets():
-    """V4A patch calls must share the write_file path budget."""
+def test_action_board_mutation_recovery_allows_progressive_patch_reconciliation():
+    """V4A patches may refine one target while each call still changes evidence."""
 
     agent = _make_agent("patch")
     agent._babel_scoped_worker = True
@@ -1008,9 +999,7 @@ def test_action_board_mutation_recovery_tracks_patch_mode_targets():
                 "task-recovery-patch",
             )
 
-    assert agent._tool_guardrail_halt_decision is not None
-    assert agent._tool_guardrail_halt_decision.code == "scoped_mutation_path_limit"
-    assert "package.json" in agent._tool_guardrail_halt_decision.message
+    assert agent._tool_guardrail_halt_decision is None
 
 
 def test_action_board_mutation_recovery_matches_absolute_worktree_path():

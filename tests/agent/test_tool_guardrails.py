@@ -163,7 +163,7 @@ def test_same_tool_varying_args_warns_by_default_without_halting():
     assert controller.halt_decision is None
 
 
-def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
+def test_hard_stop_does_not_halt_distinct_failures_of_the_same_tool():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(
             hard_stop_enabled=True,
@@ -179,9 +179,11 @@ def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
     assert second.action == "warn"
     assert second.code == "same_tool_failure_warning"
     third = controller.after_call("terminal", {"command": "cmd-3"}, '{"exit_code":1}', failed=True)
-    assert third.action == "halt"
-    assert third.code == "same_tool_failure_halt"
-    assert third.count == 3
+    fourth = controller.after_call("terminal", {"command": "cmd-4"}, '{"exit_code":1}', failed=True)
+    assert third.action == "warn"
+    assert fourth.action == "warn"
+    assert {third.code, fourth.code} == {"same_tool_failure_warning"}
+    assert controller.halt_decision is None
 
 
 def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_default():

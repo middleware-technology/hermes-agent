@@ -141,6 +141,16 @@ class _OpenAIProxy:
 
 OpenAI = _OpenAIProxy()
 
+
+class StaleProviderResponseTimeout(TimeoutError):
+    """A provider request stopped producing response data before completion.
+
+    This is intentionally distinct from ordinary connect/read timeouts.  The
+    conversation loop gives a genuinely silent request one fresh-connection
+    retry, then advances through the user's configured fallback models instead
+    of spending every generic retry on the same unresponsive backend.
+    """
+
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -204,6 +214,7 @@ from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
+    _coerce_responses_value as _coerce_codex_responses_value,
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
     _deterministic_call_id as _codex_deterministic_call_id,
     _split_responses_tool_id as _codex_split_responses_tool_id,
@@ -2152,6 +2163,10 @@ class AIAgent:
         else:
             self._fallback_chain = []
         self._fallback_index = 0
+        # Providers proven unusable for the current turn (for example an
+        # invalid API key or an account-wide licence rejection). Credentials
+        # may be repaired before the next user turn, so this is not global.
+        self._fallback_unavailable_providers = set()
         self._fallback_activated = getattr(self, "_fallback_activated", False)
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
@@ -3185,6 +3200,7 @@ class AIAgent:
         # ── Reset fallback state ──
         self._fallback_activated = False
         self._fallback_index = 0
+        self._fallback_unavailable_providers = set()
 
         # When the user deliberately swaps primary providers (e.g. openrouter
         # → anthropic), drop any fallback entries that target the OLD primary
@@ -7756,7 +7772,13 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+    def _run_codex_stream(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta: callable = None,
+        on_stream_activity: callable = None,
+    ):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
 
@@ -7776,6 +7798,11 @@ class AIAgent:
                 with active_client.responses.stream(**api_kwargs) as stream:
                     for event in stream:
                         self._touch_activity("receiving stream response")
+                        if on_stream_activity:
+                            try:
+                                on_stream_activity()
+                            except Exception:
+                                pass
                         if self._interrupt_requested:
                             break
                         event_type = getattr(event, "type", "")
@@ -7822,6 +7849,7 @@ class AIAgent:
                                 self._client_log_context(),
                             )
                     final_response = stream.get_final_response()
+                    final_response = _coerce_codex_responses_value(final_response)
                     # PATCH: ChatGPT Codex backend streams valid output items
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
@@ -7861,7 +7889,11 @@ class AIAgent:
                     self._client_log_context(),
                     exc,
                 )
-                return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                return self._run_codex_create_stream_fallback(
+                    api_kwargs,
+                    client=active_client,
+                    on_stream_activity=on_stream_activity,
+                )
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
@@ -7878,10 +7910,41 @@ class AIAgent:
                         "Responses stream did not emit response.completed; falling back to create(stream=True). %s",
                         self._client_log_context(),
                     )
-                    return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                    return self._run_codex_create_stream_fallback(
+                        api_kwargs,
+                        client=active_client,
+                        on_stream_activity=on_stream_activity,
+                    )
+                raise
+            except AttributeError as exc:
+                # Some ChatGPT Codex SSE events arrive as raw dictionaries.
+                # The OpenAI SDK Responses accumulator assumes Pydantic event
+                # objects and can fail on `.to_dict()` before returning a
+                # response. Bypass that accumulator through the raw iterable
+                # fallback once instead of multiplying the shape mismatch
+                # through Hermes's outer three-attempt retry loop.
+                detail = str(exc)
+                if "'dict' object has no attribute" in detail and any(
+                    field in detail for field in ("'to_dict'", "'output'")
+                ):
+                    logger.warning(
+                        "Codex Responses SDK received raw dictionary events; "
+                        "switching this request to the shape-tolerant stream path. %s",
+                        self._client_log_context(),
+                    )
+                    return self._run_codex_create_stream_fallback(
+                        api_kwargs,
+                        client=active_client,
+                        on_stream_activity=on_stream_activity,
+                    )
                 raise
 
-    def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
+    def _run_codex_create_stream_fallback(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_stream_activity: callable = None,
+    ):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
         active_client = client or self._ensure_primary_openai_client(reason="codex_create_stream_fallback")
         fallback_kwargs = dict(api_kwargs)
@@ -7890,8 +7953,11 @@ class AIAgent:
         stream_or_response = active_client.responses.create(**fallback_kwargs)
 
         # Compatibility shim for mocks or providers that still return a concrete response.
-        if hasattr(stream_or_response, "output"):
-            return stream_or_response
+        if hasattr(stream_or_response, "output") or (
+            isinstance(stream_or_response, dict)
+            and ("output" in stream_or_response or "output_text" in stream_or_response)
+        ):
+            return _coerce_codex_responses_value(stream_or_response)
         if not hasattr(stream_or_response, "__iter__"):
             return stream_or_response
 
@@ -7901,6 +7967,11 @@ class AIAgent:
         try:
             for event in stream_or_response:
                 self._touch_activity("receiving stream response")
+                if on_stream_activity:
+                    try:
+                        on_stream_activity()
+                    except Exception:
+                        pass
                 event_type = getattr(event, "type", None)
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
@@ -7926,6 +7997,7 @@ class AIAgent:
                 if terminal_response is None and isinstance(event, dict):
                     terminal_response = event.get("response")
                 if terminal_response is not None:
+                    terminal_response = _coerce_codex_responses_value(terminal_response)
                     # Backfill empty output from collected stream events
                     _out = getattr(terminal_response, "output", None)
                     if isinstance(_out, list) and not _out:
@@ -8322,6 +8394,11 @@ class AIAgent:
         """
         result = {"response": None, "error": None}
         request_client_holder = {"client": None}
+        response_activity = {"last_at": None, "event_count": 0}
+
+        def _mark_response_activity() -> None:
+            response_activity["last_at"] = time.time()
+            response_activity["event_count"] += 1
 
         def _call():
             try:
@@ -8334,6 +8411,7 @@ class AIAgent:
                         api_kwargs,
                         client=request_client_holder["client"],
                         on_first_delta=getattr(self, "_codex_on_first_delta", None),
+                        on_stream_activity=_mark_response_activity,
                     )
                 elif self.api_mode == "anthropic_messages":
                     result["response"] = self._anthropic_messages_create(api_kwargs)
@@ -8401,20 +8479,35 @@ class AIAgent:
                     f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
                 )
 
-            # Stale-call detector: kill the connection if no response
-            # arrives within the configured timeout.
-            _elapsed = time.time() - _call_start
-            if _elapsed > _stale_timeout:
+            # Stale-call detector: kill only after a full inactivity window.
+            # Codex Responses runs inside this wrapper but emits stream events
+            # while reasoning and generating.  Measuring total wall time here
+            # imposed a hidden duration ceiling on healthy long responses; use
+            # time since the last stream event instead.  Truly non-streaming
+            # providers retain the same behavior because their last activity
+            # remains the request start time.
+            _now = time.time()
+            _elapsed = _now - _call_start
+            _last_response_at = response_activity["last_at"] or _call_start
+            _inactive_for = _now - _last_response_at
+            if _inactive_for > _stale_timeout:
                 _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
                 logger.warning(
-                    "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                    "model=%s context=~%s tokens. Killing connection.",
-                    _elapsed, _stale_timeout,
+                    "Provider response inactive for %.0fs (threshold %.0fs, "
+                    "total elapsed %.0fs, stream events %s). model=%s "
+                    "context=~%s tokens. Killing connection.",
+                    _inactive_for, _stale_timeout, _elapsed,
+                    response_activity["event_count"],
                     api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
+                _activity_label = (
+                    "No response from provider"
+                    if response_activity["event_count"] == 0
+                    else "Provider response stopped making progress"
+                )
                 self._emit_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                    f"⚠️ {_activity_label} for {int(_inactive_for)}s "
+                    f"(model: {api_kwargs.get('model', 'unknown')}). "
                     f"Aborting call."
                 )
                 try:
@@ -8428,14 +8521,16 @@ class AIAgent:
                 except Exception:
                     pass
                 self._touch_activity(
-                    f"stale non-streaming call killed after {int(_elapsed)}s"
+                    f"stale provider response killed after {int(_inactive_for)}s inactive"
                 )
                 # Wait briefly for the thread to notice the closed connection.
                 t.join(timeout=2.0)
                 if result["error"] is None and result["response"] is None:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
+                    result["error"] = StaleProviderResponseTimeout(
+                        f"Provider response timed out after {int(_inactive_for)}s "
+                        f"without progress (threshold: {int(_stale_timeout)}s; "
+                        f"stream events: {response_activity['event_count']}; "
+                        f"total elapsed: {int(_elapsed)}s)"
                     )
                 break
 
@@ -9517,6 +9612,70 @@ class AIAgent:
 
     # ── Provider fallback ──────────────────────────────────────────────────
 
+    _PROVIDER_WIDE_ACCESS_ERROR_MARKERS = (
+        "invalid api key",
+        "api key is invalid",
+        "incorrect api key",
+        "authentication failed",
+        "authentication error",
+        "invalid authentication",
+        "invalid credentials",
+        "credentials are invalid",
+        "token was rejected",
+        "token is invalid",
+        "token has expired",
+        "not licensed",
+        "account is not authorized",
+        "account is unauthorized",
+        "subscription is inactive",
+    )
+
+    def _quarantine_current_provider_for_turn(
+        self,
+        *,
+        status_code: Optional[int],
+        api_error: Exception,
+        classified_reason: Optional[FailoverReason] = None,
+    ) -> bool:
+        """Skip an account-wide broken provider for the rest of this turn.
+
+        A fallback chain can legitimately contain several models from one
+        provider. If that provider rejects the credential or account, trying
+        every model only multiplies the same failure. Model-specific access,
+        rate limits, and usage limits are deliberately not quarantined so a
+        second configured model on the same provider can still recover.
+        """
+        message = str(api_error or "").lower()
+        provider_wide = (
+            status_code in {401, 402}
+            or classified_reason == FailoverReason.auth_permanent
+            or (
+                status_code == 403
+                and any(
+                    marker in message
+                    for marker in self._PROVIDER_WIDE_ACCESS_ERROR_MARKERS
+                )
+            )
+        )
+        if not provider_wide:
+            return False
+
+        provider = (getattr(self, "provider", "") or "").strip().lower()
+        if not provider:
+            return False
+        unavailable = getattr(self, "_fallback_unavailable_providers", None)
+        if unavailable is None:
+            unavailable = set()
+            self._fallback_unavailable_providers = unavailable
+        unavailable.add(provider)
+        logging.warning(
+            "Provider %s quarantined for the current turn after account-wide "
+            "access failure (HTTP %s)",
+            provider,
+            status_code,
+        )
+        return True
+
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Switch to the next fallback model/provider in the chain.
 
@@ -9547,6 +9706,14 @@ class AIAgent:
         fb_model = (fb.get("model") or "").strip()
         if not fb_provider or not fb_model:
             return self._try_activate_fallback()  # skip invalid, try next
+
+        unavailable = getattr(self, "_fallback_unavailable_providers", set())
+        if fb_provider in unavailable:
+            logging.warning(
+                "Fallback skip: provider %s is unavailable for the current turn",
+                fb_provider,
+            )
+            return self._try_activate_fallback(reason=reason)
 
         # Skip entries that resolve to the current (provider, model) — falling
         # back to the same backend that just failed loops the failure. Compare
@@ -9815,6 +9982,7 @@ class AIAgent:
             # ── Reset fallback chain for the new turn ──
             self._fallback_activated = False
             self._fallback_index = 0
+            self._fallback_unavailable_providers = set()
 
             logging.info(
                 "Primary runtime restored for new turn: %s (%s)",
@@ -11532,36 +11700,16 @@ class AIAgent:
                             counts = getattr(self, "_scoped_mutation_path_counts", {})
                             count = int(counts.get(normalized_path, 0)) + 1
                             counts[normalized_path] = count
-                            try:
-                                path_limit = max(
-                                    2,
-                                    int(
-                                        os.environ.get(
-                                            "BABEL_ACTION_BOARD_MUTATION_PATH_LIMIT",
-                                            "4",
-                                        )
-                                    ),
-                                )
-                            except (TypeError, ValueError):
-                                path_limit = 4
-                            if count >= path_limit:
-                                decision = ToolGuardrailDecision(
-                                    action="halt",
-                                    code="scoped_mutation_path_limit",
-                                    message=(
-                                        f"Stopped {tool_name}: recovery path "
-                                        f"'{normalized_path}' was edited {count} "
-                                        "times without reaching another deliverable. "
-                                        "Change target before continuing. "
-                                        f"BABEL_CONTINUATION_DISABLE_PATH: {normalized_path}"
-                                    ),
-                                    tool_name=tool_name,
-                                    count=count,
-                                    signature=ToolCallSignature.from_call(
-                                        tool_name, function_args
-                                    ),
-                                )
-                            elif (
+                            # Keep the historical recovery contract as a
+                            # compatibility fallback: an explicit mutation
+                            # limit is sufficient to close a segment once the
+                            # bounded window is full.  The newer
+                            # ``MUST_RESUME`` marker still adds the stricter
+                            # post-batch boundary below, but ordinary
+                            # ``file_tools`` continuations must not replay the
+                            # same write indefinitely when callers omit that
+                            # marker (older Babel adapters do).
+                            if (
                                 mutation_count >= mutation_limit
                                 and not decision.should_halt
                             ):
@@ -11585,12 +11733,11 @@ class AIAgent:
                 getattr(self, "_scoped_mutation_recovery", False)
                 or getattr(self, "_scoped_read_only_recovery", False)
             ):
-                # A recovery segment may inspect one named file and then make
-                # one concrete edit in the same segment.  Halting immediately
-                # after the first read forced an avoidable read-only model
-                # round trip before the worker could use the returned content.
-                # A second read still proves non-progress and checkpoints the
-                # segment so recovery cannot become an inspection loop.
+                # A recovery segment may inspect several distinct named causal
+                # files before a coherent edit batch. Repeated reads of one
+                # path and the card-local total-read budget are tracked
+                # separately, so a multi-file repair is grounded without
+                # turning recovery into repository inventory.
                 self._scoped_recovery_read_calls = int(
                     getattr(self, "_scoped_recovery_read_calls", 0)
                 ) + 1
@@ -11661,39 +11808,9 @@ class AIAgent:
                                     function_args,
                                 ),
                             )
-                read_limit = (
-                    _scoped_verification_read_limit()
-                    if read_only_recovery
-                    else _scoped_mutation_recovery_read_limit(
-                        getattr(
-                            self,
-                            "_scoped_recovery_read_limit_override",
-                            None,
-                        )
-                    )
-                )
-                if self._scoped_recovery_read_calls > read_limit:
-                    decision = ToolGuardrailDecision(
-                        action="halt",
-                        code="scoped_recovery_read_limit",
-                        message=(
-                            "Stopped targeted evidence reads after "
-                            f"{self._scoped_recovery_read_calls} calls (limit "
-                            f"{read_limit}). "
-                            + (
-                                "Use the collected evidence and run the smallest exact "
-                                "acceptance check instead of reading more files."
-                                if read_only_recovery
-                                else "Use the returned file content and make the smallest "
-                                "project mutation instead of rereading the worktree."
-                            )
-                        ),
-                        tool_name=tool_name,
-                        count=self._scoped_recovery_read_calls,
-                        signature=ToolCallSignature.from_call(
-                            tool_name, function_args
-                        ),
-                    )
+                # Distinct, targeted evidence reads are productive and have no
+                # aggregate ceiling. Repeated identical/path reads above remain
+                # the no-progress signal.
             elif tool_name == "terminal":
                 # The host boundary replaces the model-authored command with
                 # a sandbox wrapper before this callback runs, so inspecting
@@ -11703,47 +11820,14 @@ class AIAgent:
                 # A read-only verification segment is not expected to edit a
                 # file, so absence of mutation cannot classify exact test,
                 # build, server, or HTTP commands as inventory. Broad shell
-                # discovery is rejected before execution by
-                # _scoped_read_only_recovery_block_message; exact-repeat and
-                # segment-token guards still bound a genuinely stuck verifier.
+                # discovery is permitted inside the read-only worktree sandbox;
+                # exact-repeat and no-progress guards still bound a genuinely
+                # stuck verifier without rejecting useful Git/test evidence.
                 if (
                     not getattr(self, "_scoped_read_only_recovery", False)
                     and not self._scoped_terminal_progress_seen
                 ):
                     self._scoped_terminal_inventory_calls += 1
-                    inventory_count = self._scoped_terminal_inventory_calls
-                    inventory_limit = _scoped_terminal_inventory_limit()
-                    if inventory_count >= inventory_limit:
-                        decision = ToolGuardrailDecision(
-                            action="halt",
-                            code="scoped_terminal_inventory_limit",
-                            message=(
-                                "Stopped repeated terminal inspection after "
-                                f"{inventory_count} calls without a file edit. "
-                                "Use the available file tools to make the smallest "
-                                "concrete change, or checkpoint with a changed strategy."
-                            ),
-                            tool_name=tool_name,
-                            count=inventory_count,
-                            signature=ToolCallSignature.from_call(
-                                tool_name, function_args
-                            ),
-                        )
-                    elif inventory_count == inventory_limit - 1:
-                        decision = ToolGuardrailDecision(
-                            action="warn",
-                            code="scoped_terminal_inventory_limit",
-                            message=(
-                                "Terminal inspection is nearing its no-progress "
-                                f"limit ({inventory_count}/{inventory_limit}); make "
-                                "a concrete edit next."
-                            ),
-                            tool_name=tool_name,
-                            count=inventory_count,
-                            signature=ToolCallSignature.from_call(
-                                tool_name, function_args
-                            ),
-                        )
                 expected_command = str(
                     getattr(self, "_scoped_exact_terminal_command", None) or ""
                 ).strip()
@@ -12032,40 +12116,11 @@ class AIAgent:
             )
             self._set_tool_guardrail_halt(decision)
             return decision.message
-        if _is_terminal_inventory_command(command):
-            decision = ToolGuardrailDecision(
-                action="halt",
-                code="scoped_verification_inventory_blocked",
-                message=(
-                    "Broad terminal inventory is disabled in this read-only verification "
-                    "continuation. Return this bounded blocker to the remediation "
-                    "controller; do not use pwd, ls, find, tree, rg, or git status."
-                ),
-                tool_name=tool_name,
-                count=1,
-                signature=ToolCallSignature.from_call(tool_name, args),
-            )
-            self._set_tool_guardrail_halt(decision)
-            return decision.message
-        terminal_calls = int(
-            getattr(self, "_scoped_verification_terminal_calls", 0)
-        ) + 1
-        self._scoped_verification_terminal_calls = terminal_calls
-        if terminal_calls > 1:
-            decision = ToolGuardrailDecision(
-                action="halt",
-                code="scoped_verification_terminal_limit",
-                message=(
-                    "Stopped a second terminal call in one read-only verification "
-                    "segment. The first command result is authoritative evidence; "
-                    "return it to the remediation controller instead of retrying."
-                ),
-                tool_name=tool_name,
-                count=terminal_calls,
-                signature=ToolCallSignature.from_call(tool_name, args),
-            )
-            self._set_tool_guardrail_halt(decision)
-            return decision.message
+        # Do not impose an aggregate terminal-call ceiling. A card may need a
+        # status/diff inspection, typecheck, test, build, and native smoke
+        # command to prove one acceptance frontier. Command ownership above
+        # and the ordinary identical-call/no-progress guardrail still stop
+        # genuine loops.
         return None
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
@@ -14677,6 +14732,7 @@ class AIAgent:
             retry_count = 0
             max_retries = self._api_max_retries
             primary_recovery_attempted = False
+            stale_response_retry_attempted = False
             max_compression_attempts = 3
             codex_auth_retry_attempted=False
             anthropic_auth_retry_attempted=False
@@ -16068,7 +16124,46 @@ class AIAgent:
                             "completed": False,
                             "interrupted": True,
                         }
-                    
+
+                    # A stale response means the provider delivered no bytes at
+                    # all before the inactivity deadline.  Retrying once is
+                    # useful because every request gets a fresh client and
+                    # connection pool; repeating the same silent request for
+                    # every generic API retry is not.  After that one recovery,
+                    # move through the user's configured fallback chain.  This
+                    # does not constrain productive long responses: the branch
+                    # only handles the explicit no-response exception raised by
+                    # the stale detector above.
+                    if isinstance(api_error, StaleProviderResponseTimeout):
+                        if not stale_response_retry_attempted:
+                            stale_response_retry_attempted = True
+                            self._emit_status(
+                                "⚠️ Provider returned no response data — "
+                                "retrying once with a fresh connection..."
+                            )
+                            logger.warning(
+                                "Stale provider response: retrying once with a "
+                                "fresh request client before fallback %s",
+                                self._client_log_context(),
+                            )
+                            continue
+
+                        self._emit_status(
+                            "⚠️ Provider remained silent after a fresh-connection "
+                            "retry — switching to a configured fallback..."
+                        )
+                        if self._try_activate_fallback(reason=FailoverReason.timeout):
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            stale_response_retry_attempted = False
+                            continue
+
+                        # No configured fallback remains.  Surface one
+                        # classified retryable failure below without making a
+                        # third identical five-minute request to this backend.
+                        retry_count = max_retries
+
                     # Check for 413 payload-too-large BEFORE generic 4xx handler.
                     # A 413 is a payload-size error — the correct response is to
                     # compress history and retry, not abort immediately.
@@ -16479,8 +16574,13 @@ class AIAgent:
                     if is_client_error:
                         # Try fallback before aborting — a different provider
                         # may not have the same issue (rate limit, auth, etc.)
+                        self._quarantine_current_provider_for_turn(
+                            status_code=status_code,
+                            api_error=api_error,
+                            classified_reason=classified.reason,
+                        )
                         self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                        if self._try_activate_fallback():
+                        if self._try_activate_fallback(reason=classified.reason):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -16546,8 +16646,13 @@ class AIAgent:
                             retry_count = 0
                             continue
                         # Try fallback before giving up entirely
+                        self._quarantine_current_provider_for_turn(
+                            status_code=status_code,
+                            api_error=api_error,
+                            classified_reason=classified.reason,
+                        )
                         self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                        if self._try_activate_fallback():
+                        if self._try_activate_fallback(reason=classified.reason):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False

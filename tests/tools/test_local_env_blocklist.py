@@ -151,6 +151,18 @@ class TestProviderEnvBlocklist:
         assert "USER" in result_env
         assert "PATH" in result_env
 
+    def test_detached_terminal_defaults_to_non_interactive_ci(self):
+        """Package-manager installs must not prompt in foreground workers."""
+        result_env = _run_with_env()
+
+        assert result_env["CI"] == "true"
+
+    def test_explicit_ci_setting_is_preserved(self):
+        """Callers may opt out for commands whose behavior depends on CI."""
+        result_env = _run_with_env(self_env={"CI": "false"})
+
+        assert result_env["CI"] == "false"
+
     def test_self_env_blocked_vars_also_stripped(self):
         """Blocked vars in self.env are stripped; non-blocked vars pass through."""
         result_env = _run_with_env(self_env={

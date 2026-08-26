@@ -799,6 +799,25 @@ def _preflight_codex_api_kwargs(
 # Response extraction helpers
 # ---------------------------------------------------------------------------
 
+def _coerce_responses_value(value: Any) -> Any:
+    """Convert raw Responses dictionaries into the SDK-like attribute shape.
+
+    The ChatGPT Codex transport can yield raw dictionaries for terminal
+    response events while the OpenAI SDK normally yields Pydantic objects.
+    Hermes must accept both shapes at this boundary; downstream normalization
+    should never depend on which wire decoder produced the response.
+    """
+    if isinstance(value, dict):
+        return SimpleNamespace(**{
+            str(key): _coerce_responses_value(item)
+            for key, item in value.items()
+        })
+    if isinstance(value, list):
+        return [_coerce_responses_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_coerce_responses_value(item) for item in value)
+    return value
+
 def _extract_responses_message_text(item: Any) -> str:
     """Extract assistant text from a Responses message output item."""
     content = getattr(item, "content", None)
@@ -839,6 +858,7 @@ def _extract_responses_reasoning_text(item: Any) -> str:
 
 def _normalize_codex_response(response: Any) -> tuple[Any, str]:
     """Normalize a Responses API object to an assistant_message-like object."""
+    response = _coerce_responses_value(response)
     output = getattr(response, "output", None)
     if not isinstance(output, list) or not output:
         # The Codex backend can return empty output when the answer was
