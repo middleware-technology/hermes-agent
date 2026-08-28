@@ -10,6 +10,7 @@ from tools.registry import (
     _module_registers_tools,
     discover_builtin_tools,
     mark_babel_action_board_boundary_rejection,
+    mark_babel_read_only_boundary_rejection,
 )
 
 
@@ -88,6 +89,40 @@ class TestBabelActionBoardBoundaryRejection:
         assert allowed == {"ok": True}
         assert handler_calls == [{"path": "private-value"}]
 
+
+class TestBabelReadOnlyBoundaryRejection:
+    def test_trusted_marker_returns_a_recoverable_tool_error(self):
+        reg = ToolRegistry()
+        handler_calls = []
+
+        def handler(args, **kwargs):
+            handler_calls.append(dict(args))
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="read_only",
+            toolset="core",
+            schema=_make_schema("read_only"),
+            handler=handler,
+        )
+        args = {"path": "README.md"}
+        mark_babel_read_only_boundary_rejection(
+            args,
+            "Babel read-only mode blocked mutating tool: write_file",
+        )
+
+        rejected = json.loads(reg.dispatch("read_only", args))
+
+        assert rejected == {
+            "error": "Babel read-only mode rejected this tool call.",
+            "code": "read_only_boundary_rejected",
+            "reason": "Babel read-only mode blocked mutating tool: write_file",
+        }
+        assert handler_calls == []
+        assert "__babel_read_only_boundary_rejection" not in args
+
+
+class TestBabelActionBoardBoundaryRejectionMarkerSanitization:
     def test_serialized_marker_is_always_removed_without_authority(self):
         reg = ToolRegistry()
         captured = []

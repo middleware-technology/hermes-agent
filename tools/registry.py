@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 _BABEL_ACTION_BOARD_REJECTION_KEY = "__babel_action_board_boundary_rejection"
 _BABEL_ACTION_BOARD_REJECTION_SENTINEL = object()
 _BABEL_ACTION_BOARD_REJECTION_REASON_MAX_CHARS = 512
+_BABEL_READ_ONLY_REJECTION_KEY = "__babel_read_only_boundary_rejection"
+_BABEL_READ_ONLY_REJECTION_SENTINEL = object()
 
 
 def mark_babel_action_board_boundary_rejection(args: dict, reason: str) -> None:
@@ -66,6 +68,43 @@ def _consume_babel_action_board_boundary_rejection(args: dict) -> str | None:
         isinstance(marker, tuple)
         and len(marker) == 2
         and marker[0] is _BABEL_ACTION_BOARD_REJECTION_SENTINEL
+        and isinstance(marker[1], str)
+        and marker[1]
+    ):
+        return marker[1][:_BABEL_ACTION_BOARD_REJECTION_REASON_MAX_CHARS]
+    return None
+
+
+def mark_babel_read_only_boundary_rejection(args: dict, reason: str) -> None:
+    """Return a trusted read-only rejection to the model without dispatching.
+
+    Read-only Chat turns must never perform a mutation, but one malformed tool
+    call should remain a normal tool result.  This lets the model choose a
+    permitted inspection path instead of turning an otherwise useful answer
+    into a failed AgentRun.
+    """
+
+    if not isinstance(args, dict):
+        raise TypeError("tool arguments must be a dictionary")
+    bounded_reason = str(reason or "This read-only Chat turn cannot use that tool.").strip()
+    if not bounded_reason:
+        bounded_reason = "This read-only Chat turn cannot use that tool."
+    args[_BABEL_READ_ONLY_REJECTION_KEY] = (
+        _BABEL_READ_ONLY_REJECTION_SENTINEL,
+        bounded_reason[:_BABEL_ACTION_BOARD_REJECTION_REASON_MAX_CHARS],
+    )
+
+
+def _consume_babel_read_only_boundary_rejection(args: dict) -> str | None:
+    """Pop and authenticate one read-only rejection capability."""
+
+    if not isinstance(args, dict):
+        return None
+    marker = args.pop(_BABEL_READ_ONLY_REJECTION_KEY, None)
+    if (
+        isinstance(marker, tuple)
+        and len(marker) == 2
+        and marker[0] is _BABEL_READ_ONLY_REJECTION_SENTINEL
         and isinstance(marker[1], str)
         and marker[1]
     ):
@@ -438,6 +477,17 @@ class ToolRegistry:
                     "error": "Action Board boundary rejected this tool call.",
                     "code": "action_board_boundary_rejected",
                     "reason": boundary_rejection,
+                },
+                ensure_ascii=False,
+            )
+
+        read_only_rejection = _consume_babel_read_only_boundary_rejection(args)
+        if read_only_rejection is not None:
+            return json.dumps(
+                {
+                    "error": "Babel read-only mode rejected this tool call.",
+                    "code": "read_only_boundary_rejected",
+                    "reason": read_only_rejection,
                 },
                 ensure_ascii=False,
             )
