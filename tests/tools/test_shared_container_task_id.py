@@ -77,6 +77,23 @@ def test_cleared_override_collapses_again():
     assert terminal_tool._resolve_container_task_id("tb2-x") == "default"
 
 
+def test_local_environment_receives_registered_non_secret_environment(tmp_path):
+    environment = terminal_tool._create_environment(
+        env_type="local",
+        image="",
+        cwd=str(tmp_path),
+        timeout=10,
+        local_config={"env": {"PATH": "/controller/bin", "COREPACK_HOME": "/cache"}},
+    )
+    try:
+        assert environment.env == {
+            "PATH": "/controller/bin",
+            "COREPACK_HOME": "/cache",
+        }
+    finally:
+        environment.cleanup()
+
+
 def test_get_active_env_reads_shared_container_from_subagent_id():
     """``get_active_env`` must see the shared ``"default"`` sandbox when
     called with a subagent's task_id, so the agent loop's turn-budget

@@ -972,6 +972,7 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - env: dict[str, str] -- Non-secret per-task process environment
 
     Args:
         task_id: The rollout's unique task identifier
@@ -1195,7 +1196,13 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_extra_args = cc.get("docker_extra_args", [])
 
     if env_type == "local":
-        return _LocalEnvironment(cwd=cwd, timeout=timeout)
+        local_environment = (
+            local_config.get("env")
+            if isinstance(local_config, dict)
+            and isinstance(local_config.get("env"), dict)
+            else None
+        )
+        return _LocalEnvironment(cwd=cwd, timeout=timeout, env=local_environment)
     
     elif env_type == "docker":
         return _DockerEnvironment(
@@ -1888,6 +1895,11 @@ def terminal_tool(
                         if env_type == "local":
                             local_config = {
                                 "persistent": config.get("local_persistent", False),
+                                "env": (
+                                    overrides.get("env")
+                                    if isinstance(overrides.get("env"), dict)
+                                    else None
+                                ),
                             }
 
                         new_env = _create_environment(
