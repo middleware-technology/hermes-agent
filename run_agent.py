@@ -11984,6 +11984,60 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
+    def _tool_start_policy_block_result(
+        self,
+        tool_call_id: str,
+        function_name: str,
+        function_args: dict,
+    ) -> str | None:
+        """Ask the host whether a tool call may be dispatched.
+
+        ``tool_start_callback`` predates the Action Board runtime and was
+        informational only.  Babel uses it as the last policy boundary before
+        a shell, file, or delegation action can leave the managed runtime.
+        Respect a non-empty callback result as a synthetic tool result instead
+        of relying on side-channel mutations in the registry: an old session
+        or a different import root must not be able to bypass the boundary.
+        """
+
+        if self.tool_start_callback is None:
+            return None
+        try:
+            decision = self.tool_start_callback(
+                tool_call_id,
+                function_name,
+                function_args,
+            )
+        except Exception as cb_err:
+            # Preserve the legacy best-effort callback behavior for hosts that
+            # use this hook purely for telemetry. Babel's boundary callback
+            # returns an explicit typed result when it needs to deny a call.
+            logging.debug(f"Tool start callback error: {cb_err}")
+            return None
+
+        if decision is None or decision is False:
+            return None
+        if isinstance(decision, str):
+            message = decision.strip()
+            if not message:
+                return None
+            return json.dumps(
+                {"error": message, "code": "host_tool_policy_rejected"},
+                ensure_ascii=False,
+            )
+        if isinstance(decision, dict):
+            result = dict(decision)
+            result.setdefault("error", "The host rejected this tool call.")
+            result.setdefault("code", "host_tool_policy_rejected")
+            return json.dumps(result, ensure_ascii=False)
+        return json.dumps(
+            {
+                "error": "The host rejected this tool call.",
+                "code": "host_tool_policy_rejected",
+            },
+            ensure_ascii=False,
+        )
+
     def _scoped_mutation_first_block_message(
         self,
         tool_name: str,
@@ -12344,28 +12398,6 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
-            # Checkpoint for file-mutating tools
-            if function_name in {"write_file", "patch"} and self._checkpoint_mgr.enabled:
-                try:
-                    file_path = function_args.get("path", "")
-                    if file_path:
-                        work_dir = self._checkpoint_mgr.get_working_dir_for_path(file_path)
-                        self._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
-                except Exception:
-                    pass
-
-            # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and self._checkpoint_mgr.enabled:
-                try:
-                    cmd = function_args.get("command", "")
-                    if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
-                        self._checkpoint_mgr.ensure_checkpoint(
-                            cwd, f"before terminal: {cmd[:60]}"
-                        )
-                except Exception:
-                    pass
-
             block_result = None
             blocked_by_guardrail = False
             try:
@@ -12466,6 +12498,39 @@ class AIAgent:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
                     print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
+        # Give the host the first and final say before presenting a call as
+        # started or submitting it to the executor.  The callback used to be
+        # telemetry-only, which meant a host could record a boundary rejection
+        # while the same command still ran through ``handle_function_call``.
+        for index, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+            if block_result is not None:
+                continue
+            host_block_result = self._tool_start_policy_block_result(tc.id, name, args)
+            if host_block_result is not None:
+                parsed_calls[index] = (tc, name, args, host_block_result, True)
+
+        # A checkpoint may persist state, so take it only after every policy
+        # layer has accepted the tool. This keeps a host-rejected call fully
+        # side-effect free, even in a concurrent tool batch.
+        for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
+            if block_result is not None or not self._checkpoint_mgr.enabled:
+                continue
+            try:
+                if name in {"write_file", "patch"}:
+                    file_path = args.get("path", "")
+                    if file_path:
+                        work_dir = self._checkpoint_mgr.get_working_dir_for_path(file_path)
+                        self._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {name}")
+                elif name == "terminal":
+                    command = args.get("command", "")
+                    if _is_destructive_command(command):
+                        cwd = args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                        self._checkpoint_mgr.ensure_checkpoint(
+                            cwd, f"before terminal: {command[:60]}"
+                        )
+            except Exception:
+                pass
+
         for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
             if block_result is not None:
                 continue
@@ -12475,15 +12540,6 @@ class AIAgent:
                     self.tool_progress_callback("tool.started", name, preview, args)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
-
-        for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
-            if block_result is not None:
-                continue
-            if self.tool_start_callback:
-                try:
-                    self.tool_start_callback(tc.id, name, args)
-                except Exception as cb_err:
-                    logging.debug(f"Tool start callback error: {cb_err}")
 
         # ── Concurrent execution ─────────────────────────────────────────
         # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag)
@@ -12904,7 +12960,19 @@ class AIAgent:
                 if not guardrail_decision.allows_execution:
                     _guardrail_block_decision = guardrail_decision
 
-            _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+            _host_policy_block_result: str | None = None
+            if _block_msg is None and _guardrail_block_decision is None:
+                _host_policy_block_result = self._tool_start_policy_block_result(
+                    tool_call.id,
+                    function_name,
+                    function_args,
+                )
+
+            _execution_blocked = (
+                _block_msg is not None
+                or _guardrail_block_decision is not None
+                or _host_policy_block_result is not None
+            )
 
             if _execution_blocked:
                 # Tool blocked by plugin or guardrail policy — skip counters,
@@ -12946,12 +13014,6 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
-            if not _execution_blocked and self.tool_start_callback:
-                try:
-                    self.tool_start_callback(tool_call.id, function_name, function_args)
-                except Exception as cb_err:
-                    logging.debug(f"Tool start callback error: {cb_err}")
-
             # Checkpoint: snapshot working dir before file-mutating tools
             if not _execution_blocked and function_name in {"write_file", "patch"} and self._checkpoint_mgr.enabled:
                 try:
@@ -12978,7 +13040,13 @@ class AIAgent:
 
             tool_start_time = time.time()
 
-            if _block_msg is not None:
+            if _host_policy_block_result is not None:
+                # The host rejected this call before it reached any executor.
+                # Keep the original tool-call ID in the transcript so the
+                # model can choose a managed recovery action.
+                function_result = _host_policy_block_result
+                tool_duration = 0.0
+            elif _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
                 tool_duration = 0.0

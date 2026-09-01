@@ -2133,6 +2133,37 @@ class TestConcurrentToolExecution:
         assert starts == [("c1", "web_search", {"query": "hello"})]
         assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
 
+    def test_sequential_host_policy_rejection_skips_dispatch(self, agent):
+        """A host policy result must prevent a regular tool from executing."""
+        tool_call = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"src/example.py","content":"blocked"}',
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+        agent._checkpoint_mgr.enabled = True
+        agent._checkpoint_mgr.ensure_checkpoint = MagicMock(
+            side_effect=AssertionError("host-rejected call must not checkpoint")
+        )
+        agent.tool_start_callback = lambda *_args: {
+            "error": "Nested agent launch is not managed by this runtime.",
+            "code": "nested_agent_cli_rejected",
+        }
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("host-rejected call must not dispatch"),
+        ):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        agent._checkpoint_mgr.ensure_checkpoint.assert_not_called()
+        assert len(messages) == 1
+        assert json.loads(messages[0]["content"]) == {
+            "error": "Nested agent launch is not managed by this runtime.",
+            "code": "nested_agent_cli_rejected",
+        }
+
     def test_concurrent_tool_callbacks_fire_for_each_tool(self, agent):
         tc1 = _mock_tool_call(name="web_search", arguments='{"query":"one"}', call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments='{"query":"two"}', call_id="c2")
@@ -2153,6 +2184,33 @@ class TestConcurrentToolExecution:
         assert len(completes) == 2
         assert {entry[0] for entry in completes} == {"c1", "c2"}
         assert {entry[3] for entry in completes} == {'{"id":1}', '{"id":2}'}
+
+    def test_concurrent_host_policy_rejection_skips_only_rejected_dispatch(self, agent):
+        """Concurrent dispatch must honour a per-call host rejection."""
+        tc1 = _mock_tool_call(
+            name="web_search", arguments='{"query":"blocked"}', call_id="c1"
+        )
+        tc2 = _mock_tool_call(
+            name="web_search", arguments='{"query":"allowed"}', call_id="c2"
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+
+        def host_policy(tool_call_id, *_args):
+            if tool_call_id == "c1":
+                return {"error": "Blocked by host policy.", "code": "host_policy"}
+            return None
+
+        agent.tool_start_callback = host_policy
+        with patch("run_agent.handle_function_call", return_value='{"ok":true}') as dispatch:
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        dispatch.assert_called_once()
+        assert json.loads(messages[0]["content"]) == {
+            "error": "Blocked by host policy.",
+            "code": "host_policy",
+        }
+        assert json.loads(messages[1]["content"]) == {"ok": True}
 
     def test_invoke_tool_handles_agent_level_tools(self, agent):
         """_invoke_tool should handle todo tool directly."""
