@@ -636,6 +636,24 @@ class TestMaskApiKey:
 
 
 class TestInit:
+    def test_subdirectory_hints_use_explicit_terminal_cwd(self, tmp_path):
+        """Progressive hints follow the selected workspace, not process cwd."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                terminal_cwd=str(tmp_path),
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert agent._subdirectory_hints.working_dir == tmp_path.resolve()
+
     def test_anthropic_base_url_accepted(self):
         """Anthropic base URLs should route to native Anthropic client."""
         with (

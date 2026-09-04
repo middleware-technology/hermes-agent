@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch
 
+from agent import subdirectory_hints
 from agent.subdirectory_hints import SubdirectoryHintTracker
 
 
@@ -176,6 +177,59 @@ class TestSubdirectoryHintTracker:
         assert "truncated" in result.lower()
         # Should be capped
         assert len(result) < 20_000
+
+    def test_large_hint_read_is_bounded(self, tmp_path, monkeypatch):
+        """Large context files are capped before decoding the whole file."""
+        sub = tmp_path / "bigdir"
+        sub.mkdir()
+        (sub / "AGENTS.md").write_text("x" * 100_000)
+        read_sizes = []
+        original_read = os.read
+
+        def bounded_read(fd, size):
+            read_sizes.append(size)
+            return original_read(fd, size)
+
+        monkeypatch.setattr(subdirectory_hints.os, "read", bounded_read)
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(sub / "file.py")}
+        )
+
+        assert result is not None
+        assert read_sizes
+        assert max(read_sizes) <= subdirectory_hints._MAX_HINT_READ_BYTES
+        assert len(result) < subdirectory_hints._MAX_HINT_READ_BYTES
+
+    def test_symlink_hint_remains_usable(self, tmp_path):
+        """Context discovery preserves support for symlinked hint files."""
+        sub = tmp_path / "linked"
+        sub.mkdir()
+        target = tmp_path / "outside.md"
+        target.write_text("outside instructions")
+        (sub / "AGENTS.md").symlink_to(target)
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(sub / "file.py")}
+        )
+
+        assert result is not None
+        assert "outside instructions" in result
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX named pipes")
+    def test_special_hint_file_is_skipped_without_blocking(self, tmp_path):
+        """Named-pipe hints are ignored before any blocking read."""
+        sub = tmp_path / "special"
+        sub.mkdir()
+        os.mkfifo(sub / "AGENTS.md")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(sub / "file.py")}
+        )
+
+        assert result is None
 
     def test_empty_args(self, project):
         """Empty args should not crash."""

@@ -16,6 +16,7 @@ Inspired by Block/goose's SubdirectoryHintTracker.
 import logging
 import os
 import shlex
+import stat
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
@@ -34,6 +35,12 @@ _HINT_FILENAMES = [
 
 # Maximum chars per hint file to prevent context bloat
 _MAX_HINT_CHARS = 8_000
+# Read a bounded byte prefix before decoding.  Context files are expected to
+# be plain text, but limiting the byte read as well as the decoded character
+# count prevents a very large file from becoming a synchronous post-tool-call
+# stall.  Four bytes per UTF-8 character preserves the character limit for
+# normal UTF-8 text while keeping the read bounded at roughly 32 KiB.
+_MAX_HINT_READ_BYTES = (_MAX_HINT_CHARS * 4) + 4
 
 # Tool argument keys that typically contain file paths
 _PATH_ARG_KEYS = {"path", "file_path", "workdir"}
@@ -44,6 +51,55 @@ _COMMAND_TOOLS = {"terminal"}
 # How many parent directories to walk up when looking for hints.
 # Prevents scanning all the way to / for deeply nested paths.
 _MAX_ANCESTOR_WALK = 5
+
+
+def _read_hint_prefix(hint_path: Path) -> Optional[tuple[str, bool]]:
+    """Read a bounded prefix from a regular context file.
+
+    This hook runs synchronously after every tool call.  Do not use
+    ``Path.read_text`` here: it accepts special files and reads the complete
+    file before the context-size cap is applied.  A named pipe, device,
+    mounted path, or unexpectedly large instruction file could therefore hold
+    the agent's tool result open indefinitely.  Symlink behavior remains
+    compatible with the existing context loader; the descriptor type is
+    checked before any bytes are read.
+
+    Returns ``(content, truncated)`` or ``None`` when the file cannot be read
+    safely.  The descriptor is checked again with ``fstat`` to close the
+    file-type race between the initial stat and open.  ``O_NONBLOCK`` also
+    makes opening a raced named pipe safe on platforms that support it.
+    """
+    try:
+        path_stat = hint_path.stat()
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISREG(path_stat.st_mode):
+        return None
+
+    open_flags = os.O_RDONLY
+    open_flags |= getattr(os, "O_NONBLOCK", 0)
+    fd: Optional[int] = None
+    try:
+        fd = os.open(hint_path, open_flags)
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            return None
+        raw = os.read(fd, _MAX_HINT_READ_BYTES)
+        truncated = opened_stat.st_size > len(raw)
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    try:
+        content = raw.decode("utf-8", errors="replace").strip()
+    except (AttributeError, UnicodeError):
+        return None
+    return content, truncated
 
 class SubdirectoryHintTracker:
     """Track which directories the agent visits and load hints on first access.
@@ -176,20 +232,19 @@ class SubdirectoryHintTracker:
         for filename in _HINT_FILENAMES:
             hint_path = directory / filename
             try:
-                if not hint_path.is_file():
+                loaded = _read_hint_prefix(hint_path)
+                if loaded is None:
                     continue
-            except OSError:
-                continue
-            try:
-                content = hint_path.read_text(encoding="utf-8").strip()
+                content, read_truncated = loaded
                 if not content:
                     continue
                 # Same security scan as startup context loading
                 content = _scan_context_content(content, filename)
-                if len(content) > _MAX_HINT_CHARS:
+                if read_truncated or len(content) > _MAX_HINT_CHARS:
                     content = (
                         content[:_MAX_HINT_CHARS]
-                        + f"\n\n[...truncated {filename}: {len(content):,} chars total]"
+                        + f"\n\n[...truncated {filename}: content exceeds "
+                        f"{_MAX_HINT_CHARS:,} character limit]"
                     )
                 # Best-effort relative path for display
                 rel_path = str(hint_path)

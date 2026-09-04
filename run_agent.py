@@ -2812,7 +2812,11 @@ class AIAgent:
                 logger.debug("Context engine on_session_start: %s", _ce_err)
 
         self._subdirectory_hints = SubdirectoryHintTracker(
-            working_dir=os.getenv("TERMINAL_CWD") or None,
+            # Host runtimes can multiplex several worktrees without changing
+            # the process-global cwd.  Prefer the explicit per-agent cwd so
+            # progressive hint discovery does not accidentally start from the
+            # packaged backend's launch directory (often "/").
+            working_dir=self.terminal_cwd or os.getenv("TERMINAL_CWD") or None,
         )
         self._user_turn_count = 0
 
