@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -388,10 +389,27 @@ class LocalEnvironment(BaseEnvironment):
     CWD persists via file-based read after each command.
     """
 
-    def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
+    def __init__(
+        self,
+        cwd: str = "",
+        timeout: int = 60,
+        env: dict = None,
+        task_id: str | None = None,
+    ):
         if cwd:
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        # Action Board workers use a unique task id and must be able to clean
+        # up foreground commands as well as registry-tracked background
+        # commands.  The default environment is shared by interactive turns,
+        # so do not attach its process groups to a per-task cleanup scope.
+        self._process_scope_id = (
+            str(task_id).strip()
+            if task_id is not None and str(task_id).strip() not in {"", "default"}
+            else None
+        )
+        self._process_group_processes: dict[int, subprocess.Popen] = {}
+        self._process_group_lock = threading.Lock()
         self.init_session()
 
     def get_temp_dir(self) -> str:
@@ -495,6 +513,9 @@ class LocalEnvironment(BaseEnvironment):
         if not _IS_WINDOWS:
             try:
                 proc._hermes_pgid = os.getpgid(proc.pid)
+                if self._process_scope_id:
+                    with self._process_group_lock:
+                        self._process_group_processes[proc._hermes_pgid] = proc
             except ProcessLookupError:
                 pass
 
@@ -539,11 +560,14 @@ class LocalEnvironment(BaseEnvironment):
             if _IS_WINDOWS:
                 proc.terminate()
             else:
-                try:
-                    pgid = os.getpgid(proc.pid)
-                except ProcessLookupError:
-                    pgid = getattr(proc, "_hermes_pgid", None)
-                    if pgid is None:
+                # Prefer the pgid captured immediately after Popen.  If the
+                # wrapper has already exited, looking up its PID can race with
+                # PID reuse and target an unrelated process group.
+                pgid = getattr(proc, "_hermes_pgid", None)
+                if pgid is None:
+                    try:
+                        pgid = os.getpgid(proc.pid)
+                    except ProcessLookupError:
                         raise
 
                 try:
@@ -593,7 +617,24 @@ class LocalEnvironment(BaseEnvironment):
         self._extract_cwd_from_output(result)
 
     def cleanup(self):
-        """Clean up temp files."""
+        """Terminate scoped command groups and clean up temp files.
+
+        A foreground shell command is intentionally not entered into
+        ``process_registry``.  On macOS, however, the shell and its children
+        still share the process group created by ``setsid`` in ``_run_bash``.
+        Retaining those group leaders for a card-scoped local environment lets
+        terminal cleanup remove a child that outlives its shell wrapper (for
+        example a mistakenly foregrounded app/server launch).
+        """
+        with self._process_group_lock:
+            scoped_processes = list(self._process_group_processes.values())
+            self._process_group_processes.clear()
+        for proc in scoped_processes:
+            try:
+                self._kill_process(proc)
+            except Exception:
+                logger.debug("Unable to clean local process group", exc_info=True)
+
         for f in (self._snapshot_path, self._cwd_file):
             try:
                 os.unlink(f)

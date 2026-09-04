@@ -1202,7 +1202,12 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             and isinstance(local_config.get("env"), dict)
             else None
         )
-        return _LocalEnvironment(cwd=cwd, timeout=timeout, env=local_environment)
+        return _LocalEnvironment(
+            cwd=cwd,
+            timeout=timeout,
+            env=local_environment,
+            task_id=task_id,
+        )
     
     elif env_type == "docker":
         return _DockerEnvironment(

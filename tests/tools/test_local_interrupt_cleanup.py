@@ -192,3 +192,39 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
             env.cleanup()
         except Exception:
             pass
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups are required")
+def test_scoped_cleanup_kills_foreground_descendant_after_wrapper_exits(tmp_path):
+    """Card cleanup must remove a child that outlives a foreground shell.
+
+    Action Board commands normally use the foreground terminal path.  A
+    command that starts a server/app and then exits its wrapper is therefore
+    absent from ``process_registry`` even though it still belongs to the
+    card's shell process group.  The task-scoped LocalEnvironment retains that
+    group until ``cleanup_vm`` calls ``cleanup``.
+    """
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=10, task_id="card-scope")
+    try:
+        result = env.execute("sleep 60 >/dev/null 2>&1 & echo foreground-child-started")
+        assert result["returncode"] == 0
+        assert "foreground-child-started" in result["output"]
+
+        scoped_groups = list(env._process_group_processes)
+        live_groups = [
+            pgid
+            for pgid in scoped_groups
+            if _pgid_still_alive(pgid)
+        ]
+        assert live_groups, "the foreground child should survive its shell wrapper"
+
+        env.cleanup()
+
+        assert all(_wait_for_pgid_exit(pgid) for pgid in live_groups), (
+            "card-scoped cleanup left a foreground descendant running"
+        )
+        assert env._process_group_processes == {}
+    finally:
+        # Keep the test self-cleaning if an assertion fails before the normal
+        # cleanup call.
+        env.cleanup()
