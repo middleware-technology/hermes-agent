@@ -20,6 +20,18 @@ Usage:
     response = agent.run_conversation("Tell me about the latest Python updates")
 """
 
+# Babel validates this marker after importing a frozen runtime. PyInstaller
+# modules do not always retain a trustworthy ``__file__``; the marker prevents
+# a stale Hermes checkout from being accepted merely because its entry point
+# imported successfully.
+BABEL_HERMES_RUNTIME_CAPABILITIES = frozenset(
+    {
+        "foreground_tool_loop_guardrails",
+        "same_target_failure",
+        "repeated_target_batch_serialization",
+    }
+)
+
 # IMPORTANT: hermes_bootstrap must be the very first import — UTF-8 stdio
 # on Windows.  No-op on POSIX.  See hermes_bootstrap.py for full rationale.
 try:
@@ -227,6 +239,7 @@ from agent.display import (
     get_tool_emoji as _get_tool_emoji,
 )
 from agent.tool_guardrails import (
+    failure_target_signature,
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolGuardrailDecision,
@@ -626,6 +639,38 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
             return False
 
     return True
+
+
+def _has_repeated_idempotent_target(tool_calls) -> bool:
+    """Return whether a batch repeats one idempotent target.
+
+    A provider can emit a whole batch of paginated reads before any result is
+    observed.  That is useful for an existing large file, but it also lets a
+    missing target evade the cross-call failure circuit breaker: every call
+    has different pagination arguments and all calls are already in flight.
+    Keep independent targets parallel, while giving repeated targets to the
+    sequential path so a successful observation clears the streak and a
+    failed observation can stop the next call before it starts.
+    """
+
+    seen: set[object] = set()
+    for tool_call in tool_calls:
+        try:
+            function_args = json.loads(tool_call.function.arguments)
+        except Exception:
+            return False
+        if not isinstance(function_args, dict):
+            return False
+        target_signature = failure_target_signature(
+            tool_call.function.name,
+            function_args,
+        )
+        if target_signature is None:
+            continue
+        if target_signature in seen:
+            return True
+        seen.add(target_signature)
+    return False
 
 
 def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Path | None:
@@ -12205,7 +12250,15 @@ class AIAgent:
                 getattr(self, "_scoped_mutation_recovery", False)
                 or getattr(self, "_scoped_read_only_recovery", False)
             )
-            if bounded_recovery or not _should_parallelize_tool_batch(tool_calls):
+            repeated_target = (
+                getattr(self._tool_guardrails.config, "hard_stop_enabled", False)
+                and _has_repeated_idempotent_target(tool_calls)
+            )
+            if (
+                bounded_recovery
+                or repeated_target
+                or not _should_parallelize_tool_batch(tool_calls)
+            ):
                 return self._execute_tool_calls_sequential(
                     assistant_message, messages, effective_task_id, api_call_count
                 )
@@ -12368,6 +12421,19 @@ class AIAgent:
         self._ensure_babel_scoped_tool_guardrails(messages)
         tool_calls = assistant_message.tool_calls
         num_tools = len(tool_calls)
+
+        # This method is also called directly by a few adapters and tests, so
+        # keep the safety boundary here as well as in _execute_tool_calls().
+        # A repeated idempotent target must be observed one result at a time;
+        # otherwise a batch of paginated failures can all pass before the
+        # controller records the first one.
+        if (
+            getattr(self._tool_guardrails.config, "hard_stop_enabled", False)
+            and _has_repeated_idempotent_target(tool_calls)
+        ):
+            return self._execute_tool_calls_sequential(
+                assistant_message, messages, effective_task_id, api_call_count
+            )
 
         # ── Pre-flight: interrupt check ──────────────────────────────────
         if self._interrupt_requested:

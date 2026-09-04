@@ -8,6 +8,7 @@ from agent.tool_guardrails import (
     ToolCallSignature,
     canonical_tool_args,
     classify_tool_failure,
+    failure_target_signature,
 )
 
 
@@ -116,6 +117,56 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
     assert blocked.action == "block"
     assert blocked.code == "repeated_exact_failure_block"
     assert blocked.count == 2
+
+
+def test_hard_stop_enabled_blocks_same_failed_read_target_with_changed_pagination():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=99,
+            same_tool_failure_halt_after=3,
+            no_progress_block_after=99,
+        )
+    )
+    path = "/tmp/missing.txt"
+
+    assert failure_target_signature("read_file", {"path": path, "offset": 1}) == failure_target_signature(
+        "read_file", {"path": path, "offset": 2}
+    )
+    for offset in (1, 2, 3):
+        args = {"path": path, "offset": offset, "limit": 1}
+        assert controller.before_call("read_file", args).action == "allow"
+        decision = controller.after_call(
+            "read_file",
+            args,
+            '{"error":"File not found"}',
+            failed=True,
+        )
+
+    assert decision.action == "warn"
+    assert decision.code == "same_target_failure_warning"
+    assert decision.count == 3
+
+    blocked = controller.before_call(
+        "read_file",
+        {"path": path, "offset": 4, "limit": 1},
+    )
+    assert blocked.action == "block"
+    assert blocked.code == "same_target_failure_block"
+    assert blocked.count == 3
+
+    # A successful observation proves progress and clears the target failure
+    # streak, so legitimate later pagination is not treated as a loop.
+    controller.after_call(
+        "read_file",
+        {"path": path, "offset": 4, "limit": 1},
+        "line 4",
+        failed=False,
+    )
+    assert controller.before_call(
+        "read_file",
+        {"path": path, "offset": 5, "limit": 1},
+    ).action == "allow"
 
 
 def test_success_resets_exact_signature_failure_streak():

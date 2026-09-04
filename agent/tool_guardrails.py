@@ -17,6 +17,12 @@ from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
 
 
+# Kept on the module so a frozen Babel backend can verify that the imported
+# guardrail implementation includes the cross-pagination failure circuit
+# breaker, even when Python does not expose a useful module origin.
+BABEL_HERMES_RUNTIME_CAPABILITIES = frozenset({"same_target_failure"})
+
+
 IDEMPOTENT_TOOL_NAMES = frozenset(
     {
         "read_file",
@@ -186,6 +192,45 @@ def canonical_tool_args(args: Mapping[str, Any]) -> str:
     )
 
 
+_PAGINATION_ARGUMENTS = frozenset(
+    {
+        "cursor",
+        "end_line",
+        "line_end",
+        "line_start",
+        "limit",
+        "max_bytes",
+        "max_lines",
+        "offset",
+        "page",
+        "start_line",
+    }
+)
+
+
+def failure_target_signature(
+    tool_name: str,
+    args: Mapping[str, Any] | None,
+) -> ToolCallSignature | None:
+    """Return a stable identity for a failed idempotent target.
+
+    Pagination changes the observation window, not the target. A missing file
+    can therefore evade exact-call detection when a model retries the same
+    path with a new ``offset`` on every turn. Successful pagination remains
+    unconstrained; this identity is only counted by the failure path.
+    """
+
+    normalized_tool = str(tool_name or "").strip()
+    if normalized_tool not in IDEMPOTENT_TOOL_NAMES:
+        return None
+    stable_args = {
+        str(key): value
+        for key, value in _coerce_args(args).items()
+        if str(key).strip().lower() not in _PAGINATION_ARGUMENTS
+    }
+    return ToolCallSignature.from_call(normalized_tool, stable_args)
+
+
 def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
     """Safety-fallback classifier used only when callers don't pass ``failed``.
 
@@ -231,6 +276,7 @@ class ToolCallGuardrailController:
     def reset_for_turn(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
+        self._same_target_failure_counts: dict[ToolCallSignature, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
 
@@ -259,6 +305,25 @@ class ToolCallGuardrailController:
             )
             self._halt_decision = decision
             return decision
+
+        target_signature = failure_target_signature(tool_name, args)
+        if target_signature is not None and target_signature != signature:
+            target_count = self._same_target_failure_counts.get(target_signature, 0)
+            if target_count >= self.config.same_tool_failure_halt_after:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="same_target_failure_block",
+                    message=(
+                        f"Blocked {tool_name}: the same target has failed {target_count} "
+                        "times despite pagination or observation changes. Stop retrying "
+                        "the target unchanged; change strategy or explain the blocker."
+                    ),
+                    tool_name=tool_name,
+                    count=target_count,
+                    signature=target_signature,
+                )
+                self._halt_decision = decision
+                return decision
 
         if self._is_idempotent(tool_name):
             record = self._no_progress.get(signature)
@@ -300,6 +365,12 @@ class ToolCallGuardrailController:
             self._exact_failure_counts[signature] = exact_count
             self._no_progress.pop(signature, None)
 
+            target_signature = failure_target_signature(tool_name, args)
+            target_count = 0
+            if target_signature is not None:
+                target_count = self._same_target_failure_counts.get(target_signature, 0) + 1
+                self._same_target_failure_counts[target_signature] = target_count
+
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
 
@@ -324,6 +395,25 @@ class ToolCallGuardrailController:
                     signature=signature,
                 )
 
+            if (
+                target_signature is not None
+                and target_signature != signature
+                and self.config.warnings_enabled
+                and target_count >= self.config.exact_failure_warn_after
+            ):
+                return ToolGuardrailDecision(
+                    action="warn",
+                    code="same_target_failure_warning",
+                    message=(
+                        f"{tool_name} has failed {target_count} times for the same target "
+                        "despite pagination or observation changes. Inspect the error and "
+                        "change strategy instead of retrying that target unchanged."
+                    ),
+                    tool_name=tool_name,
+                    count=target_count,
+                    signature=target_signature,
+                )
+
             if self.config.warnings_enabled and same_count >= self.config.same_tool_failure_warn_after:
                 return ToolGuardrailDecision(
                     action="warn",
@@ -341,6 +431,9 @@ class ToolCallGuardrailController:
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
+        target_signature = failure_target_signature(tool_name, args)
+        if target_signature is not None:
+            self._same_target_failure_counts.pop(target_signature, None)
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)

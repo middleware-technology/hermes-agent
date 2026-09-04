@@ -586,6 +586,51 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert completed_events[0][1] == "web_search"
 
 
+def test_hard_stop_dispatch_serializes_repeated_paginated_target_before_execution():
+    """A repeated missing target cannot escape through one parallel batch."""
+
+    config = {
+        "tool_loop_guardrails": {
+            "warnings_enabled": True,
+            "hard_stop_enabled": True,
+            "hard_stop_after": {
+                "exact_failure": 99,
+                "same_tool_failure": 3,
+                "idempotent_no_progress": 99,
+            },
+        }
+    }
+    agent = _make_agent("read_file", config=config)
+    calls = [
+        _mock_tool_call(
+            "read_file",
+            json.dumps({"path": "missing.md", "offset": offset, "limit": 1}),
+            f"c-{offset}",
+        )
+        for offset in range(1, 7)
+    ]
+    messages = []
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"error": "File not found"}),
+    ) as mock_hfc:
+        agent._execute_tool_calls(
+            SimpleNamespace(content="", tool_calls=calls),
+            messages,
+            "task-repeated-paginated-target",
+        )
+
+    # The first three observations are allowed. The fourth is blocked before
+    # dispatch, and the remaining speculative calls are skipped in order.
+    assert mock_hfc.call_count == 3
+    assert len(messages) == len(calls)
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "same_target_failure_block"
+    assert "same_target_failure_block" in messages[3]["content"]
+    assert "skipped" in messages[4]["content"]
+
+
 def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     agent = _make_agent("web_search")
     args = {"query": "same"}
