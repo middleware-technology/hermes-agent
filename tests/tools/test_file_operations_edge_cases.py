@@ -8,7 +8,11 @@ Covers:
 import pytest
 from unittest.mock import MagicMock, patch
 
-from tools.file_operations import ShellFileOperations, _parse_search_context_line
+from tools.file_operations import (
+    FILE_METADATA_TIMEOUT_SECONDS,
+    ShellFileOperations,
+    _parse_search_context_line,
+)
 
 
 # =========================================================================
@@ -295,6 +299,50 @@ class TestPaginationBounds:
         assert "     1|line1" in result.content
         sed_commands = [cmd for cmd in commands if cmd.startswith("sed -n")]
         assert sed_commands == ["sed -n '1,1p' 'notes.txt'"]
+
+    def test_missing_file_lookup_is_bounded_and_typed(self):
+        """A degraded filesystem must not consume the full terminal timeout."""
+        env = MagicMock()
+        env.cwd = "/tmp"
+        ops = ShellFileOperations(env)
+
+        with patch.object(
+            ops,
+            "_exec",
+            return_value=MagicMock(exit_code=124, stdout="[Command timed out]"),
+        ) as mock_exec:
+            result = ops.read_file("README.md")
+
+        assert result.error == (
+            f"File lookup timed out after {FILE_METADATA_TIMEOUT_SECONDS}s: README.md"
+        )
+        assert "retry" in (result.hint or "").lower()
+        mock_exec.assert_called_once_with(
+            "wc -c < 'README.md' 2>/dev/null",
+            timeout=FILE_METADATA_TIMEOUT_SECONDS,
+        )
+
+    def test_missing_file_suggestion_listing_is_also_bounded(self):
+        """Suggestion lookup must not reintroduce an unbounded directory probe."""
+        env = MagicMock()
+        env.cwd = "/tmp"
+        ops = ShellFileOperations(env)
+        calls = []
+
+        def fake_exec(command, *args, **kwargs):
+            calls.append((command, kwargs))
+            if command.startswith("wc -c"):
+                return MagicMock(exit_code=1, stdout="")
+            return MagicMock(exit_code=124, stdout="[Command timed out]")
+
+        with patch.object(ops, "_exec", side_effect=fake_exec):
+            result = ops.read_file("missing/README.md")
+
+        assert result.error == (
+            f"File lookup timed out after {FILE_METADATA_TIMEOUT_SECONDS}s: "
+            "missing/README.md"
+        )
+        assert calls[-1][1] == {"timeout": FILE_METADATA_TIMEOUT_SECONDS}
 
     def test_search_clamps_offset_and_limit_before_building_head_pipeline(self):
         env = MagicMock()

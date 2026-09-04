@@ -459,6 +459,12 @@ LINTERS_INPROC = {
 MAX_LINES = 2000
 MAX_LINE_LENGTH = 2000
 MAX_FILE_SIZE = 50 * 1024  # 50KB
+# Metadata probes are deliberately shorter than content reads.  A missing
+# path must not consume the terminal's full command timeout while ``wc`` (or
+# the directory listing used for suggestions) waits on a degraded filesystem
+# or remote backend.  The actual content commands retain the environment's
+# normal timeout because large/remote files may legitimately need longer.
+FILE_METADATA_TIMEOUT_SECONDS = 8
 DEFAULT_READ_OFFSET = 1
 DEFAULT_READ_LIMIT = 500
 DEFAULT_SEARCH_OFFSET = 0
@@ -711,9 +717,20 @@ class ShellFileOperations(FileOperations):
         
         # Check if file exists and get size (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
-        
+        stat_result = self._exec(stat_cmd, timeout=FILE_METADATA_TIMEOUT_SECONDS)
+
         if stat_result.exit_code != 0:
+            if stat_result.exit_code == 124:
+                return ReadResult(
+                    error=(
+                        f"File lookup timed out after {FILE_METADATA_TIMEOUT_SECONDS}s: "
+                        f"{path}"
+                    ),
+                    hint=(
+                        "The workspace or remote filesystem did not answer in time. "
+                        "Verify the path or retry after the environment recovers."
+                    ),
+                )
             # File not found - try to suggest similar files
             return self._suggest_similar_files(path)
         
@@ -794,7 +811,19 @@ class ShellFileOperations(FileOperations):
 
         # List files in the target directory
         ls_cmd = f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50"
-        ls_result = self._exec(ls_cmd)
+        ls_result = self._exec(ls_cmd, timeout=FILE_METADATA_TIMEOUT_SECONDS)
+
+        if ls_result.exit_code == 124:
+            return ReadResult(
+                error=(
+                    f"File lookup timed out after {FILE_METADATA_TIMEOUT_SECONDS}s: "
+                    f"{path}"
+                ),
+                hint=(
+                    "The workspace or remote filesystem did not answer in time. "
+                    "Verify the path or retry after the environment recovers."
+                ),
+            )
 
         scored: list = []  # (score, filepath) — higher is better
         if ls_result.exit_code == 0 and ls_result.stdout.strip():
@@ -844,8 +873,19 @@ class ShellFileOperations(FileOperations):
         """
         path = self._expand_path(path)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
+        stat_result = self._exec(stat_cmd, timeout=FILE_METADATA_TIMEOUT_SECONDS)
         if stat_result.exit_code != 0:
+            if stat_result.exit_code == 124:
+                return ReadResult(
+                    error=(
+                        f"File lookup timed out after {FILE_METADATA_TIMEOUT_SECONDS}s: "
+                        f"{path}"
+                    ),
+                    hint=(
+                        "The workspace or remote filesystem did not answer in time. "
+                        "Verify the path or retry after the environment recovers."
+                    ),
+                )
             return self._suggest_similar_files(path)
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
         try:
