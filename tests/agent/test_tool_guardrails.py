@@ -9,6 +9,7 @@ from agent.tool_guardrails import (
     canonical_tool_args,
     classify_tool_failure,
     failure_target_signature,
+    repeated_terminal_observation_target,
 )
 
 
@@ -73,6 +74,30 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.exact_failure_block_after == 6
     assert cfg.same_tool_failure_halt_after == 7
     assert cfg.no_progress_block_after == 8
+
+
+def test_repeated_terminal_observation_target_detects_same_read_only_check_in_one_payload():
+    command = "\n".join(
+        "stat __babel_missing_probe__.md" for _ in range(25)
+    )
+
+    assert repeated_terminal_observation_target(command) == (
+        "stat",
+        "__babel_missing_probe__.md",
+        25,
+    )
+
+
+def test_repeated_terminal_observation_target_allows_distinct_targets_and_commands():
+    assert repeated_terminal_observation_target(
+        "stat first.md; stat second.md; test -e third.md"
+    ) is None
+    assert repeated_terminal_observation_target(
+        "stat first.md; file first.md; test -e first.md"
+    ) is None
+    assert repeated_terminal_observation_target(
+        "printf 'stat first.md; stat first.md'"
+    ) is None
 
 
 def test_default_repeated_identical_failed_call_warns_without_blocking():

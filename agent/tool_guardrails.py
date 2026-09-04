@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -20,7 +23,12 @@ from agent.tool_result_classification import file_mutation_result_landed
 # Kept on the module so a frozen Babel backend can verify that the imported
 # guardrail implementation includes the cross-pagination failure circuit
 # breaker, even when Python does not expose a useful module origin.
-BABEL_HERMES_RUNTIME_CAPABILITIES = frozenset({"same_target_failure"})
+BABEL_HERMES_RUNTIME_CAPABILITIES = frozenset(
+    {
+        "same_target_failure",
+        "terminal_batch_observation_guardrails",
+    }
+)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -64,6 +72,177 @@ MUTATING_TOOL_NAMES = frozenset(
         "process",
     }
 )
+
+
+# A terminal tool call is a mutation-capable tool because its payload may run
+# arbitrary shell code.  That classification is intentionally retained.  This
+# narrower set is only used to identify repeated, read-only observations packed
+# into one shell payload, which would otherwise bypass the per-tool-call
+# failure circuit breaker.
+_TERMINAL_OBSERVATION_COMMANDS = frozenset(
+    {"cat", "file", "head", "ls", "readlink", "stat", "tail", "test", "wc"}
+)
+_TERMINAL_COMMAND_WRAPPERS = frozenset({"builtin", "command", "env", "sudo"})
+_SHELL_SEGMENT_SEPARATOR = re.compile(r"(?:&&|\|\||[;|&])")
+
+
+def _terminal_shell_segments(command: str) -> list[str]:
+    """Split simple shell command chains without splitting quoted separators.
+
+    This is deliberately a small inspection heuristic, not a shell parser. It
+    only needs to recognize direct command chains such as ``stat path; stat
+    path``. Quoted strings and escaped separators remain part of their command,
+    so a legitimate argument containing ``;`` does not become a false repeat.
+    Unsupported shell syntax simply produces no additional segments and is
+    left to the normal terminal executor and guardrails.
+    """
+
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if escaped:
+            current.append(character)
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            current.append(character)
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            current.append(character)
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            current.append(character)
+            index += 1
+            continue
+
+        separator = _SHELL_SEGMENT_SEPARATOR.match(command, index)
+        if separator is not None:
+            segment = "".join(current).strip()
+            if segment:
+                segments.append(segment)
+            current = []
+            index = separator.end()
+            continue
+        if character == "\n":
+            segment = "".join(current).strip()
+            if segment:
+                segments.append(segment)
+            current = []
+            index += 1
+            continue
+        current.append(character)
+        index += 1
+
+    segment = "".join(current).strip()
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+def _terminal_observation_target(
+    tokens: list[str],
+) -> tuple[str, str] | None:
+    """Return ``(command, target)`` for a conservative read-only invocation."""
+
+    if not tokens:
+        return None
+    command_index = 0
+    while command_index < len(tokens) and tokens[command_index] in _TERMINAL_COMMAND_WRAPPERS:
+        command_index += 1
+    if command_index >= len(tokens):
+        return None
+
+    executable = os.path.basename(tokens[command_index])
+    if executable not in _TERMINAL_OBSERVATION_COMMANDS:
+        return None
+    arguments = tokens[command_index + 1 :]
+    if not arguments:
+        return None
+
+    targets: list[str] = []
+    skip_next = False
+    for argument in arguments:
+        if skip_next:
+            skip_next = False
+            continue
+        if argument == "]":
+            continue
+        if argument == "--":
+            continue
+        if executable == "test" and argument in {"!", "["}:
+            continue
+        if argument.startswith("-"):
+            # Common option/value pairs for these inspection commands. Unknown
+            # flags are ignored rather than guessed as paths.
+            if argument in {
+                "-c", "--format", "-f", "--printf", "-n", "--lines",
+                "-m", "--max-count", "-t", "--time-style",
+            }:
+                skip_next = True
+            continue
+        targets.append(argument)
+
+    # A command with multiple independent targets is not an exact repeated
+    # observation of one target. It may be a legitimate inventory operation.
+    if len(targets) != 1:
+        return None
+    target = os.path.normpath(targets[0])
+    if not target or target == ".":
+        return None
+    return executable, target
+
+
+def repeated_terminal_observation_target(
+    command: str,
+    *,
+    minimum_repeats: int = 2,
+) -> tuple[str, str, int] | None:
+    """Find one repeated read-only command/target within a terminal payload.
+
+    The return value is safe guardrail metadata: command name, normalized
+    target, and repeat count. This does not execute or rewrite the shell
+    payload. Distinct targets and distinct observation commands remain allowed.
+    """
+
+    if not isinstance(command, str) or not command.strip():
+        return None
+    try:
+        threshold = max(2, int(minimum_repeats))
+    except (TypeError, ValueError):
+        threshold = 2
+
+    counts: dict[tuple[str, str], int] = {}
+    for segment in _terminal_shell_segments(command):
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            # Malformed quoting is not evidence of a repeated observation.
+            continue
+        observation = _terminal_observation_target(tokens)
+        if observation is None:
+            continue
+        count = counts.get(observation, 0) + 1
+        counts[observation] = count
+    repeated = [
+        (observation, count)
+        for observation, count in counts.items()
+        if count >= threshold
+    ]
+    if not repeated:
+        return None
+    (command_name, target), count = max(repeated, key=lambda item: item[1])
+    return command_name, target, count
 
 
 @dataclass(frozen=True)

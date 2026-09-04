@@ -29,6 +29,7 @@ BABEL_HERMES_RUNTIME_CAPABILITIES = frozenset(
         "foreground_tool_loop_guardrails",
         "same_target_failure",
         "repeated_target_batch_serialization",
+        "terminal_batch_observation_guardrails",
     }
 )
 
@@ -240,6 +241,7 @@ from agent.display import (
 )
 from agent.tool_guardrails import (
     failure_target_signature,
+    repeated_terminal_observation_target,
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolGuardrailDecision,
@@ -12033,6 +12035,53 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
+    def _terminal_batch_guardrail_decision(
+        self,
+        function_name: str,
+        function_args: dict,
+    ) -> ToolGuardrailDecision | None:
+        """Stop repeated read-only shell observations before they execute.
+
+        ``terminal`` remains mutation-capable and therefore is intentionally
+        not added to the idempotent tool set. A model can nevertheless pack
+        dozens of identical ``stat``/``test`` calls into one shell payload,
+        bypassing the per-tool-call failure circuit breaker. Apply the same
+        hard-stop boundary only to that narrow, observable pattern. Normal
+        scripts, distinct targets, and changing observation commands remain
+        available to the model.
+        """
+
+        if function_name != "terminal":
+            return None
+        config = getattr(self._tool_guardrails, "config", None)
+        if not getattr(config, "hard_stop_enabled", False):
+            return None
+        command = (
+            function_args.get("command")
+            if isinstance(function_args, dict)
+            else None
+        )
+        repeated = repeated_terminal_observation_target(command)
+        if repeated is None:
+            return None
+        observation_name, target, count = repeated
+        decision = ToolGuardrailDecision(
+            action="halt",
+            code="terminal_batch_repeated_observation",
+            message=(
+                "Stopped terminal execution before running "
+                f"{count} repeated '{observation_name}' observations of "
+                f"'{target}' in one shell payload. Use the first observation "
+                "or choose a different target/command instead of replaying the "
+                "same check."
+            ),
+            tool_name=function_name,
+            count=count,
+            signature=ToolCallSignature.from_call(function_name, function_args),
+        )
+        self._set_tool_guardrail_halt(decision)
+        return decision
+
     def _tool_start_policy_block_result(
         self,
         tool_call_id: str,
@@ -12549,6 +12598,13 @@ class AIAgent:
                     parsed_calls.append((tool_call, function_name, function_args, block_result, True))
                     continue
                 guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
+                if guardrail_decision.allows_execution:
+                    batch_guardrail_decision = self._terminal_batch_guardrail_decision(
+                        function_name,
+                        function_args,
+                    )
+                    if batch_guardrail_decision is not None:
+                        guardrail_decision = batch_guardrail_decision
                 if not guardrail_decision.allows_execution:
                     block_result = self._guardrail_block_result(guardrail_decision)
                     blocked_by_guardrail = True
@@ -13027,6 +13083,13 @@ class AIAgent:
             _guardrail_block_decision: ToolGuardrailDecision | None = None
             if _block_msg is None:
                 guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
+                if guardrail_decision.allows_execution:
+                    batch_guardrail_decision = self._terminal_batch_guardrail_decision(
+                        function_name,
+                        function_args,
+                    )
+                    if batch_guardrail_decision is not None:
+                        guardrail_decision = batch_guardrail_decision
                 if not guardrail_decision.allows_execution:
                     _guardrail_block_decision = guardrail_decision
 

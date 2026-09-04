@@ -631,6 +631,64 @@ def test_hard_stop_dispatch_serializes_repeated_paginated_target_before_executio
     assert "skipped" in messages[4]["content"]
 
 
+def test_hard_stop_blocks_repeated_terminal_observation_batch_before_execution():
+    """A shell batch cannot hide repeated missing-path checks from the guardrail."""
+
+    agent = _make_agent("terminal", config=_hard_stop_config())
+    command = "\n".join(
+        "stat __babel_missing_probe__.md" for _ in range(25)
+    )
+    call = _mock_tool_call(
+        "terminal",
+        json.dumps({"command": command}),
+        "c-terminal-batch-repeat",
+    )
+    messages = []
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"output": "SHOULD_NOT_RUN", "exit_code": 1}),
+    ) as mock_hfc:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[call]),
+            messages,
+            "task-terminal-batch-repeat",
+        )
+
+    mock_hfc.assert_not_called()
+    assert len(messages) == 1
+    assert messages[0]["tool_call_id"] == "c-terminal-batch-repeat"
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == (
+        "terminal_batch_repeated_observation"
+    )
+    assert "25 repeated 'stat' observations" in messages[0]["content"]
+
+
+def test_hard_stop_allows_terminal_observations_for_distinct_targets():
+    agent = _make_agent("terminal", config=_hard_stop_config())
+    call = _mock_tool_call(
+        "terminal",
+        json.dumps({"command": "stat first.md; stat second.md"}),
+        "c-terminal-distinct-targets",
+    )
+    messages = []
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"output": "checks completed", "exit_code": 0}),
+    ) as mock_hfc:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[call]),
+            messages,
+            "task-terminal-distinct-targets",
+        )
+
+    mock_hfc.assert_called_once()
+    assert agent._tool_guardrail_halt_decision is None
+    assert "checks completed" in messages[0]["content"]
+
+
 def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     agent = _make_agent("web_search")
     args = {"query": "same"}
